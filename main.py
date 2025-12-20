@@ -2,7 +2,7 @@ import os
 import asyncio
 import random
 import logging
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from aiohttp import web
 
@@ -11,8 +11,6 @@ from aiohttp import web
 # ==========================================
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-# ID Channel tempat Anda boleh menyuruh bot (Opsional)
-# Jika tidak diisi di Render, bot hanya nurut sama OWNER_ID di chat private/grup
 CMD_CHANNEL_ID = os.environ.get("CMD_CHANNEL_ID", None)
 if CMD_CHANNEL_ID:
     CMD_CHANNEL_ID = int(CMD_CHANNEL_ID)
@@ -41,25 +39,37 @@ STATUS = {
 app = Client("my_render_bot", session_string=SESSION_STRING)
 
 # ==========================================
-# FILTER IZIN (Updated: Support Channel)
+# FILTER IZIN
 # ==========================================
 def is_authorized(_, __, message):
-    # 1. Cek apakah pesan dari OWNER (di Private/Grup)
     is_owner = message.from_user and message.from_user.id == OWNER_ID
-    
-    # 2. Cek apakah pesan dari CHANNEL MARKAS (Channel Post)
     is_cmd_channel = False
     if CMD_CHANNEL_ID and message.chat:
         if message.chat.id == CMD_CHANNEL_ID:
             is_cmd_channel = True
-            
     return is_owner or is_cmd_channel
 
-# Gabungkan filter command + filter izin
 auth_filter = filters.create(is_authorized)
 
 # ==========================================
-# WEB SERVER & LOGIC (SAMA SEPERTI SEBELUMNYA)
+# HELPER: REFRESH DIALOGS
+# ==========================================
+async def force_refresh_dialogs():
+    """Memancing cache agar kenal ID grup/channel"""
+    # print("🔄 Auto-Refresh Cache...") # Debug di console
+    count = 0
+    try:
+        # Baca 100 chat terakhir tempat bot bergabung
+        async for dialog in app.get_dialogs(limit=100):
+            count += 1
+            _ = dialog.chat.id 
+        return True, count
+    except Exception as e:
+        print(f"❌ Refresh Fail: {e}")
+        return False, 0
+
+# ==========================================
+# WEB SERVER
 # ==========================================
 async def web_server():
     async def handle(request):
@@ -88,18 +98,14 @@ def parse_link(link):
         return None, None
 
 async def send_log(text):
-    # Kirim ke Channel Log (Jika diset)
     if CONFIG["log_channel"]:
         try:
             await app.send_message(CONFIG["log_channel"], f"🤖 **BOT LOG:**\n{text}")
-        except:
-            pass
-    # Kirim juga ke Channel Command (Tempat kita merintah) agar terlihat balasannya
+        except: pass
     if CMD_CHANNEL_ID:
         try:
             await app.send_message(CMD_CHANNEL_ID, f"💬 **Info:**\n{text}")
-        except:
-            pass
+        except: pass
 
 async def background_worker(src_chat, start_id, end_id, message_cmd):
     STATUS["is_running"] = True
@@ -147,12 +153,16 @@ async def background_worker(src_chat, start_id, end_id, message_cmd):
             await send_log(f"⚠️ **FloodWait** {e.value} detik.")
             await asyncio.sleep(e.value + 5)
         except Exception as e:
+            # Jika masih error peer invalid saat loop, coba refresh lagi
+            if "PEER_ID_INVALID" in str(e) or "CHANNEL_INVALID" in str(e):
+                await force_refresh_dialogs()
+            
             print(f"Err {current_id}: {e}")
             STATUS["total_failed"] += 1
             await asyncio.sleep(2)
 
     await send_log(f"🏁 **SELESAI!**\nSukses: {STATUS['total_success']}")
-    CONFIG["target_chat"] = None # Auto Clear
+    CONFIG["target_chat"] = None
     STATUS["is_running"] = False
 
 # ==========================================
@@ -161,27 +171,37 @@ async def background_worker(src_chat, start_id, end_id, message_cmd):
 
 @app.on_message(filters.command("start") & auth_filter)
 async def start_cmd(_, message):
-    await message.reply("👋 **Bot Ready di Channel & Private!**")
+    await message.reply("👋 **Bot Ready!**\nFitur Auto-Refresh sudah aktif di `/copy`.")
+
+@app.on_message(filters.command("refresh") & auth_filter)
+async def refresh_cmd(_, message):
+    msg = await message.reply("🔄 **Manual Refresh...**")
+    success, count = await force_refresh_dialogs()
+    if success:
+        await msg.edit(f"✅ **Sukses!** Memuat {count} chat.")
+    else:
+        await msg.edit("❌ Gagal.")
 
 @app.on_message(filters.command("help") & auth_filter)
 async def help_cmd(_, message):
     await message.reply(
         "🛠 **MENU:**\n"
         "`/set_target [id] [topic]`\n"
-        "`/set_log [id]`\n"
+        "`/copy [link1] [link2]` (Auto-Refresh)\n"
         "`/config [min] [max] [limit] [sleep]`\n"
-        "`/copy [link1] [link2]`\n"
-        "`/pause` `/resume` `/stop` `/status`"
+        "`/status` `/stop` `/pause` `/resume`"
     )
 
 @app.on_message(filters.command("set_target") & auth_filter)
 async def set_target(_, message):
     try:
+        # Auto refresh juga saat set target biar aman
+        await force_refresh_dialogs()
         CONFIG["target_chat"] = int(message.command[1])
         CONFIG["target_topic"] = int(message.command[2]) if len(message.command) > 2 else None
-        await message.reply("✅ Target OK")
+        await message.reply("✅ Target OK (Cache Refreshed)")
     except:
-        await message.reply("❌ Fail. `/set_target -100xxx 0`")
+        await message.reply("❌ Fail. Format: `/set_target -100xxxx 0`")
 
 @app.on_message(filters.command("set_log") & auth_filter)
 async def set_log(_, message):
@@ -204,15 +224,29 @@ async def config_set(_, message):
 
 @app.on_message(filters.command("copy") & auth_filter)
 async def copy_start(_, message):
+    if STATUS["is_running"]:
+        return await message.reply("⚠️ Sedang sibuk! `/stop` dulu.")
     if not CONFIG["target_chat"]:
         return await message.reply("⚠️ Set Target dulu!")
+    
     try:
+        # === FITUR BARU: AUTO REFRESH SEBELUM MULAI ===
+        status_msg = await message.reply("🔄 **Menyiapkan cache & link...**")
+        await force_refresh_dialogs()
+        # ==============================================
+
         src, s_id = parse_link(message.command[1])
         _, e_id = parse_link(message.command[2])
-        if not src: return await message.reply("❌ Link Invalid")
+        
+        if not src: 
+            return await status_msg.edit("❌ Link Invalid / Tidak Terbaca.")
+        
+        await status_msg.delete() # Hapus pesan loading
         STATUS["task"] = asyncio.create_task(background_worker(src, s_id, e_id, message))
-    except:
-        await message.reply("❌ Link Error / Format Salah")
+    except IndexError:
+        await message.reply("❌ Format Salah. Contoh:\n`/copy link1 link2`")
+    except Exception as e:
+        await message.reply(f"❌ Error: {e}")
 
 @app.on_message(filters.command("status") & auth_filter)
 async def status_cmd(_, message):
@@ -222,7 +256,6 @@ async def status_cmd(_, message):
 async def stop_cmd(_, message):
     STATUS["is_running"] = False
     if STATUS["task"]: STATUS["task"].cancel()
-    # Reset Target juga
     CONFIG["target_chat"] = None
     CONFIG["target_topic"] = None
     await message.reply("🛑 Stopped & Reset.")
@@ -244,4 +277,5 @@ if __name__ == "__main__":
     print("🚀 Bot Starting...")
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
+    loop.create_task(force_refresh_dialogs()) # Refresh awal saat boot
     app.run()
