@@ -3,16 +3,18 @@ import asyncio
 import random
 import re
 import logging
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait
+from aiohttp import web # Tambahan untuk Web Service
 
-# --- KONFIGURASI DARI RENDER (ENVIRONMENT VARIABLES) ---
-# Pastikan nama variabel di Render SAMA PERSIS dengan yang di dalam kurung ("...")
+# --- KONFIGURASI DARI RENDER ---
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 CMD_CHANNEL_ID = int(os.environ.get("CMD_CHANNEL_ID", 0)) 
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
+# Render otomatis memberi PORT, kalau lokal pakai 8080
+PORT = int(os.environ.get("PORT", 8080)) 
 
 # Logger setup
 logging.basicConfig(level=logging.INFO)
@@ -20,7 +22,7 @@ logger = logging.getLogger("RenderBot")
 
 # Inisialisasi Client
 if not API_ID or not API_HASH or not SESSION_STRING:
-    logger.error("❌ ERROR: Variable Environment belum diisi lengkap di Render!")
+    logger.error("❌ ERROR: Variable Environment belum diisi lengkap!")
     exit(1)
 
 app = Client(
@@ -31,42 +33,30 @@ app = Client(
     in_memory=True
 )
 
-# Global Flags & Control
+# Global Flags
 IS_WORKING = False
 STOP_EVENT = asyncio.Event()
 
-# --- FUNGSI PARSING & HELPER ---
+# --- FUNGSI PARSING & HELPER (Sama seperti sebelumnya) ---
 
 def parse_link(link):
-    """Mengubah link t.me menjadi chat_id dan message_id/thread_id"""
     if not link: return None, None
-    
-    # Format Private: t.me/c/123456789/100
     private_match = re.search(r"t\.me/c/(\d+)/(\d+)", link)
     if private_match:
-        chat_id = int("-100" + private_match.group(1))
-        msg_id = int(private_match.group(2))
-        return chat_id, msg_id
-
-    # Format Public: t.me/namachannel/100
+        return int("-100" + private_match.group(1)), int(private_match.group(2))
     public_match = re.search(r"t\.me/([^/]+)/(\d+)", link)
     if public_match:
-        username = public_match.group(1)
-        msg_id = int(public_match.group(2))
-        return username, msg_id
-        
+        return public_match.group(1), int(public_match.group(2))
     return None, None
 
 async def resolve_peer(chat_id):
-    """Pemanasan agar bot mengenali chat ID"""
     try:
         await app.get_chat(chat_id)
         return True
-    except Exception as e:
-        logger.error(f"Gagal resolve peer {chat_id}: {e}")
+    except:
         return False
 
-# --- WORKER UTAMA (PEMROSES FILE) ---
+# --- WORKER UTAMA ---
 
 async def copy_worker(config, status_msg):
     global IS_WORKING
@@ -85,103 +75,69 @@ async def copy_worker(config, status_msg):
     processed_count = 0
     current_id = src_start
 
-    # Tahap 1: Pemanasan
-    await status_msg.edit(f"🔄 **Menyiapkan Akses...**\nMencoba mengenali Chat Sumber & Tujuan...")
-    
-    if not await resolve_peer(src_chat):
-        await status_msg.edit(f"❌ **Gagal!** Bot tidak bisa akses Sumber.\nPastikan akun sudah join.")
-        IS_WORKING = False
-        return
-        
-    if not await resolve_peer(dst_chat):
-        await status_msg.edit(f"❌ **Gagal!** Bot tidak bisa akses Tujuan.\nPastikan akun sudah join.")
+    await status_msg.edit(f"🔄 **Menyiapkan Akses...**")
+    if not await resolve_peer(src_chat) or not await resolve_peer(dst_chat):
+        await status_msg.edit(f"❌ **Gagal!** Bot tidak bisa akses Sumber/Tujuan.")
         IS_WORKING = False
         return
 
-    await status_msg.edit(f"🚀 **Gas! Mulai Copy...**\n`{src_start}` ➔ `{src_end}`")
+    await status_msg.edit(f"🚀 **Mulai Copy...**\n`{src_start}` ➔ `{src_end}`")
 
     try:
         while current_id <= src_end:
-            # Cek Sinyal Stop
             if STOP_EVENT.is_set():
-                await status_msg.edit("⏹ **Dihentikan oleh Admin.**")
+                await status_msg.edit("⏹ **Dihentikan.**")
                 break
 
             try:
-                # Ambil Pesan
                 msg = await app.get_messages(src_chat, current_id)
-
                 if msg and not msg.empty and not msg.service:
-                    # Filter Sticker
                     if msg.sticker:
-                        logger.info(f"Skip Sticker: {current_id}")
+                        pass
                     else:
-                        # Eksekusi Copy
                         try:
                             await msg.copy(
                                 chat_id=dst_chat,
                                 reply_to_message_id=dst_topic if dst_topic else None
                             )
                             processed_count += 1
-                            
-                            # Jeda Random (Agar aman)
-                            sleep_time = random.randint(delay_min, delay_max)
-                            await asyncio.sleep(sleep_time)
-
+                            await asyncio.sleep(random.randint(delay_min, delay_max))
                         except FloodWait as e:
-                            wait_sec = e.value + 5
-                            await status_msg.edit(f"⚠️ **Telegram Marah (FloodWait)**\nDisuruh tidur {wait_sec} detik...")
-                            await asyncio.sleep(wait_sec)
-                            continue # Ulangi pesan yang sama
+                            await status_msg.edit(f"⚠️ **FloodWait** {e.value}s...")
+                            await asyncio.sleep(e.value + 5)
+                            continue
 
-                # Cek Batch (Istirahat Panjang)
                 if processed_count > 0 and processed_count % batch_size == 0:
-                    await status_msg.edit(
-                        f"☕ **Istirahat Batch**\n"
-                        f"Sudah copy: {processed_count} file\n"
-                        f"Posisi ID: {current_id}\n"
-                        f"Tidur {batch_wait} detik..."
-                    )
+                    await status_msg.edit(f"☕ **Istirahat Batch**\nID: {current_id}\nTidur {batch_wait}s...")
                     await asyncio.sleep(batch_wait)
-                    await status_msg.edit(f"🚀 **Lanjut Kerja...**\nPosisi ID: {current_id}")
+                    await status_msg.edit(f"🚀 **Lanjut...** ID: {current_id}")
 
-            except Exception as e:
-                logger.error(f"Skip ID {current_id} karena error: {e}")
+            except Exception:
+                pass
 
-            # Update Laporan di Channel (Tiap 20 ID biar gak spam)
             if current_id % 20 == 0:
-                 try:
-                     await status_msg.edit(
-                        f"🏃 **Status Jalan**\n"
-                        f"Target: {current_id} / {src_end}\n"
-                        f"Sukses: {processed_count}"
-                    )
+                 try: await status_msg.edit(f"🏃 **Proses:** {current_id}/{src_end}\nSukses: {processed_count}")
                  except: pass
 
-            current_id += 1 # Lanjut ke pesan berikutnya
+            current_id += 1
 
         if not STOP_EVENT.is_set():
-            await status_msg.edit(f"✅ **Selesai Bos!**\nTotal sukses: {processed_count} file.")
+            await status_msg.edit(f"✅ **Selesai!** Total: {processed_count}")
 
     except Exception as e:
-        await status_msg.edit(f"❌ **Error Fatal:** {str(e)}")
-    
+        await status_msg.edit(f"❌ Error: {e}")
     finally:
         IS_WORKING = False
 
-# --- FITUR CHAT & PERINTAH ---
+# --- HANDLER COMMAND ---
 
 @app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.user(OWNER_ID) & filters.command("copy"))
 async def start_handler(client, message):
     global IS_WORKING
+    if IS_WORKING: return await message.reply("⚠️ Sedang sibuk.")
     
-    if IS_WORKING:
-        return await message.reply("⚠️ **Antrian Penuh!**\nSelesaikan tugas sekarang atau kirim `/stop` dulu.")
-
-    # Parsing Perintah
     text = message.text
     config = {}
-    
     try:
         for line in text.split('\n'):
             if "sumber_awal:" in line: config['src_start_link'] = line.split(":", 1)[1].strip()
@@ -193,42 +149,60 @@ async def start_handler(client, message):
             if "batch:" in line: config['batch_size'] = int(line.split(":", 1)[1].strip())
             if "jeda_batch:" in line: config['batch_wait'] = int(line.split(":", 1)[1].strip())
 
-        # Validasi Link
         src_chat, start_id = parse_link(config.get('src_start_link'))
         _, end_id = parse_link(config.get('src_end_link'))
         dst_chat, dst_topic = parse_link(config.get('dst_link'))
 
-        if not src_chat or not start_id or not end_id or not dst_chat:
-            return await message.reply("❌ **Format Salah!**\nLink sumber/tujuan tidak valid. Cek lagi.")
+        if not src_chat or not dst_chat: return await message.reply("❌ Link salah.")
 
         job_config = {
-            'src_chat': src_chat,
-            'start_id': start_id,
-            'end_id': end_id,
-            'dst_chat': dst_chat,
-            'dst_topic': dst_topic,
+            'src_chat': src_chat, 'start_id': start_id, 'end_id': end_id,
+            'dst_chat': dst_chat, 'dst_topic': dst_topic,
             'delay_range': config.get('delay_range', (5, 10)),
             'batch_size': config.get('batch_size', 50),
             'batch_wait': config.get('batch_wait', 300)
         }
-
-        status_msg = await message.reply("⚙️ **Perintah Diterima.**\nMemulai worker di server...")
-        asyncio.create_task(copy_worker(job_config, status_msg))
-
-    except Exception as e:
-        await message.reply(f"❌ **Error Parsing:**\n{e}")
+        msg = await message.reply("⚙️ Memulai worker...")
+        asyncio.create_task(copy_worker(job_config, msg))
+    except Exception as e: await message.reply(f"❌ Error: {e}")
 
 @app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.user(OWNER_ID) & filters.command("stop"))
 async def stop_handler(client, message):
     if IS_WORKING:
         STOP_EVENT.set()
-        await message.reply("🛑 **Mengerem...**\nMenunggu proses berhenti dengan aman.")
+        await message.reply("🛑 Mengerem...")
     else:
-        await message.reply("💤 Bot lagi gak ngapa-ngapain.")
+        await message.reply("💤 Bot idle.")
 
 @app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.user(OWNER_ID) & filters.command("ping"))
 async def ping_handler(client, message):
-    await message.reply("🏓 **Pong!**\nServer Render Aktif & Sehat.")
+    await message.reply("🏓 Pong! Web Service Aktif.")
 
-print("Bot Userbot Siap di Render...")
-app.run()
+# --- WEB SERVER (AGAR RENDER TIDAK MEMATIKAN BOT) ---
+
+async def web_health_check(request):
+    return web.Response(text="Bot Sedang Berjalan! Jangan dimatikan.")
+
+async def start_web_server():
+    server = web.Application()
+    server.add_routes([web.get('/', web_health_check)])
+    runner = web.AppRunner(server)
+    await runner.setup()
+    # Bind ke 0.0.0.0 dan PORT dari Render
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"🌍 Web Server berjalan di Port {PORT}")
+
+async def main():
+    # Jalanin Web Server dulu
+    await start_web_server()
+    # Jalanin Bot Telegram
+    logger.info("🤖 Menjalankan Userbot...")
+    await app.start()
+    await idle()
+    await app.stop()
+
+if __name__ == "__main__":
+    # Loop Asyncio Utama
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
