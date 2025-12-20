@@ -4,6 +4,7 @@ import random
 import re
 import logging
 import sys
+import gc # Garbage Collector untuk hemat RAM
 from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, RPCError, InternalServerError
 from aiohttp import web
@@ -11,15 +12,16 @@ from aiohttp import web
 # --- LOGGING SYSTEM ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("RenderBot")
+# Matikan log pyrogram yang berisik, kita pakai log manual
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 def debug_log(text):
-    print(f"[DEBUG] {text}", flush=True)
+    print(f"[LOG] {text}", flush=True)
 
-debug_log("--- SYSTEM BOOT: VERSION ANTI-INTERDC ---")
+debug_log("--- SYSTEM BOOT: VERSION ANTI-HANG (TIMEOUT) ---")
 
 # --- KONFIGURASI ---
 try:
@@ -80,8 +82,8 @@ async def copy_worker(config, status_msg):
                 await status_msg.edit("⏹ **Stop.**")
                 break
             
-            # LOOP RETRY (Untuk menangani error server telegram)
-            max_retries = 5
+            # --- LOGIKA RETRY & TIMEOUT ---
+            max_retries = 3
             retry_count = 0
             success = False
 
@@ -89,58 +91,67 @@ async def copy_worker(config, status_msg):
                 if STOP_EVENT.is_set(): break
                 
                 try:
-                    # Ambil Pesan
+                    # Ambil pesan
                     msg = await app.get_messages(src_chat, current_id)
                     
                     if msg and not msg.empty and not msg.service and not msg.sticker:
-                        # Proses Copy
-                        await msg.copy(
-                            chat_id=dst_chat,
-                            reply_to_message_id=config['dst_topic'] if config['dst_topic'] else None
+                        debug_log(f"⏳ Mengirim ID {current_id}...")
+                        
+                        # [PENTING] WRAP DENGAN TIMEOUT 60 DETIK
+                        # Jika 60 detik gak kelar, anggap macet dan kill.
+                        await asyncio.wait_for(
+                            msg.copy(
+                                chat_id=dst_chat,
+                                reply_to_message_id=config['dst_topic'] if config['dst_topic'] else None
+                            ),
+                            timeout=60.0 
                         )
-                        # Jika berhasil, keluar dari loop retry
+                        
                         success = True
-                        debug_log(f"✅ Copied ID {current_id}")
+                        debug_log(f"✅ Sukses ID {current_id}")
+                        
+                        # Hapus objek pesan dari memori (Hemat RAM)
+                        del msg
+                        gc.collect()
+
                         await asyncio.sleep(random.randint(*config['delay_range']))
                         break 
                     else:
-                        # Pesan kosong/sticker, anggap sukses (skip)
-                        success = True
+                        success = True # Skip pesan kosong/sticker
                         break
 
+                except asyncio.TimeoutError:
+                    retry_count += 1
+                    debug_log(f"⏰ TIMEOUT! ID {current_id} macet > 60s. Percobaan {retry_count}/{max_retries}")
+                    await asyncio.sleep(5) # Istirahat sebentar sebelum coba lagi
+                    
                 except FloodWait as e:
-                    debug_log(f"⚠️ FloodWait {e.value}s. Tidur dulu...")
-                    await status_msg.edit(f"⏳ **Limit Telegram:** Tunggu {e.value} detik...")
+                    debug_log(f"🌊 FloodWait {e.value}s.")
+                    await status_msg.edit(f"⏳ **Limit:** Tunggu {e.value}s...")
                     await asyncio.sleep(e.value + 5)
-                    # Jangan break, coba lagi pesan yang sama setelah tidur
+                    # Jangan tambah retry_count kalau floodwait, coba terus sampai bisa
 
-                except (InternalServerError, RPCError) as e:
-                    # INI PENANGANAN ERROR 500 INTERDC
-                    err_str = str(e)
-                    if "500" in err_str or "INTERDC" in err_str or "bussy" in err_str:
-                        retry_count += 1
-                        wait_time = 10 * retry_count
-                        debug_log(f"⚠️ Telegram Server Error (DC). Mencoba lagi dalam {wait_time}s... (Percobaan {retry_count}/{max_retries})")
-                        await asyncio.sleep(wait_time)
-                        continue # Ulangi loop retry
-                    else:
-                        debug_log(f"❌ Error Lain ID {current_id}: {e}")
-                        break # Error lain (misal dilarang kirim), skip aja
-                
                 except Exception as e:
-                    debug_log(f"❌ Error Umum ID {current_id}: {e}")
-                    break
+                    err_str = str(e)
+                    if "500" in err_str or "INTERDC" in err_str:
+                        retry_count += 1
+                        debug_log(f"⚠️ Server Error (Percobaan {retry_count}).")
+                        await asyncio.sleep(10)
+                    else:
+                        debug_log(f"❌ Error Fatal ID {current_id}: {e}")
+                        break # Error lain skip aja
 
-            # Jika gagal setelah 5x coba, kita skip saja biar gak macet selamanya
+            # Jika sudah retry 3x masih timeout/error, kita SKIP paksa
             if not success and retry_count >= max_retries:
-                debug_log(f"⏭️ Skip ID {current_id} karena Server Telegram Bermasalah terus.")
+                debug_log(f"💀 SKIP ID {current_id} (Sudah 3x Gagal/Macet).")
+                try: await status_msg.edit(f"⚠️ **Skip ID {current_id}** (File Bermasalah)")
+                except: pass
 
-            # Update Status ke User
+            # Update Status
             if current_id % 20 == 0:
                 try: await status_msg.edit(f"🏃 **Proses:** {current_id} / {end_id}")
                 except: pass
             
-            # Pindah ke pesan berikutnya
             current_id += 1
         
         if not STOP_EVENT.is_set():
@@ -154,7 +165,8 @@ async def copy_worker(config, status_msg):
 # --- HANDLER ---
 @app.on_message(filters.chat(CMD_CHANNEL_ID), group=-1)
 async def spy(client, message):
-    print(f"📩 LOG: {message.text}", flush=True)
+    # Log irit saja biar gak spam
+    pass 
 
 @app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.command("copy"))
 async def start_cmd(client, message):
@@ -201,10 +213,10 @@ async def ping_cmd(client, message):
 
 # --- WEB SERVER ---
 async def web_handler(request):
-    return web.Response(text="Bot is Running.")
+    return web.Response(text="Bot Running.")
 
 async def start_web():
-    debug_log(f"🌍 Web Server Port {PORT}")
+    debug_log(f"🌍 Web Start Port {PORT}")
     app_web = web.Application()
     app_web.add_routes([web.get('/', web_handler)])
     runner = web.AppRunner(app_web)
@@ -214,13 +226,13 @@ async def start_web():
 
 async def main():
     await start_web()
-    debug_log("🤖 Starting Telegram...")
+    debug_log("🤖 Start Telegram...")
     try:
         await app.start()
         debug_log("📚 Refresh Cache...")
         async for d in app.get_dialogs(limit=20): pass
         debug_log("✅ READY!")
-        try: await app.send_message(CMD_CHANNEL_ID, "✅ **Bot Siap! (Versi Anti-Error 500)**")
+        try: await app.send_message(CMD_CHANNEL_ID, "✅ **Bot Anti-Hang Siap!**")
         except: pass
         await idle()
     except Exception as e:
