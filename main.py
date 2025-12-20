@@ -1,3 +1,7 @@
+print("--- SYSTEM CHECK: KODE BERHASIL DILOAD ---", flush=True)
+import os
+# ... kode sisanya ...
+
 import os
 import asyncio
 import random
