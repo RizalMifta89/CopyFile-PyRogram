@@ -5,11 +5,10 @@ import re
 import logging
 import sys
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, RPCError, InternalServerError
 from aiohttp import web
 
-# --- LOGGING ---
-# Memaksa log keluar ke konsol Render
+# --- LOGGING SYSTEM ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,7 +19,7 @@ logger = logging.getLogger("RenderBot")
 def debug_log(text):
     print(f"[DEBUG] {text}", flush=True)
 
-debug_log("--- SYSTEM BOOT ---")
+debug_log("--- SYSTEM BOOT: VERSION ANTI-INTERDC ---")
 
 # --- KONFIGURASI ---
 try:
@@ -28,7 +27,7 @@ try:
     API_HASH = os.environ.get("API_HASH", "")
     SESSION_STRING = os.environ.get("SESSION_STRING", "")
     CMD_CHANNEL_ID = int(os.environ.get("CMD_CHANNEL_ID", 0)) 
-    PORT = int(os.environ.get("PORT", 8080)) # Default port Render
+    PORT = int(os.environ.get("PORT", 8080))
 except Exception as e:
     debug_log(f"❌ Config Error: {e}")
 
@@ -62,7 +61,7 @@ async def resolve_peer(chat_id):
     except:
         return False
 
-# --- WORKER ---
+# --- WORKER UTAMA ---
 async def copy_worker(config, status_msg):
     global IS_WORKING
     IS_WORKING = True
@@ -80,44 +79,88 @@ async def copy_worker(config, status_msg):
             if STOP_EVENT.is_set():
                 await status_msg.edit("⏹ **Stop.**")
                 break
-            try:
-                msg = await app.get_messages(src_chat, current_id)
-                if msg and not msg.empty and not msg.service and not msg.sticker:
-                    await msg.copy(
-                        chat_id=dst_chat,
-                        reply_to_message_id=config['dst_topic'] if config['dst_topic'] else None
-                    )
-                    await asyncio.sleep(random.randint(*config['delay_range']))
-            except FloodWait as e:
-                await asyncio.sleep(e.value + 5)
-            except Exception:
-                pass
             
+            # LOOP RETRY (Untuk menangani error server telegram)
+            max_retries = 5
+            retry_count = 0
+            success = False
+
+            while retry_count < max_retries:
+                if STOP_EVENT.is_set(): break
+                
+                try:
+                    # Ambil Pesan
+                    msg = await app.get_messages(src_chat, current_id)
+                    
+                    if msg and not msg.empty and not msg.service and not msg.sticker:
+                        # Proses Copy
+                        await msg.copy(
+                            chat_id=dst_chat,
+                            reply_to_message_id=config['dst_topic'] if config['dst_topic'] else None
+                        )
+                        # Jika berhasil, keluar dari loop retry
+                        success = True
+                        debug_log(f"✅ Copied ID {current_id}")
+                        await asyncio.sleep(random.randint(*config['delay_range']))
+                        break 
+                    else:
+                        # Pesan kosong/sticker, anggap sukses (skip)
+                        success = True
+                        break
+
+                except FloodWait as e:
+                    debug_log(f"⚠️ FloodWait {e.value}s. Tidur dulu...")
+                    await status_msg.edit(f"⏳ **Limit Telegram:** Tunggu {e.value} detik...")
+                    await asyncio.sleep(e.value + 5)
+                    # Jangan break, coba lagi pesan yang sama setelah tidur
+
+                except (InternalServerError, RPCError) as e:
+                    # INI PENANGANAN ERROR 500 INTERDC
+                    err_str = str(e)
+                    if "500" in err_str or "INTERDC" in err_str or "bussy" in err_str:
+                        retry_count += 1
+                        wait_time = 10 * retry_count
+                        debug_log(f"⚠️ Telegram Server Error (DC). Mencoba lagi dalam {wait_time}s... (Percobaan {retry_count}/{max_retries})")
+                        await asyncio.sleep(wait_time)
+                        continue # Ulangi loop retry
+                    else:
+                        debug_log(f"❌ Error Lain ID {current_id}: {e}")
+                        break # Error lain (misal dilarang kirim), skip aja
+                
+                except Exception as e:
+                    debug_log(f"❌ Error Umum ID {current_id}: {e}")
+                    break
+
+            # Jika gagal setelah 5x coba, kita skip saja biar gak macet selamanya
+            if not success and retry_count >= max_retries:
+                debug_log(f"⏭️ Skip ID {current_id} karena Server Telegram Bermasalah terus.")
+
+            # Update Status ke User
             if current_id % 20 == 0:
-                try: await status_msg.edit(f"🏃 **Proses:** {current_id}")
+                try: await status_msg.edit(f"🏃 **Proses:** {current_id} / {end_id}")
                 except: pass
             
+            # Pindah ke pesan berikutnya
             current_id += 1
         
         if not STOP_EVENT.is_set():
             await status_msg.edit("✅ **Selesai.**")
+            
     except Exception as e:
-        debug_log(f"Worker Error: {e}")
+        debug_log(f"Worker Crash: {e}")
     finally:
         IS_WORKING = False
 
 # --- HANDLER ---
-# Handler untuk melihat pesan masuk (DEBUG)
 @app.on_message(filters.chat(CMD_CHANNEL_ID), group=-1)
 async def spy(client, message):
-    print(f"📩 PESAN MASUK: {message.text}", flush=True)
+    print(f"📩 LOG: {message.text}", flush=True)
 
 @app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.command("copy"))
 async def start_cmd(client, message):
     global IS_WORKING
     if IS_WORKING: return await message.reply("⚠️ Sibuk.")
     
-    # Simple Parser
     try:
         txt = message.text
         conf = {}
@@ -156,53 +199,33 @@ async def stop_cmd(client, message):
 async def ping_cmd(client, message):
     await message.reply("🏓 Pong!")
 
-# --- WEB SERVER (PENTING AGAR TIDAK DISCONNECTED) ---
+# --- WEB SERVER ---
 async def web_handler(request):
-    return web.Response(text="Bot is Running correctly.")
+    return web.Response(text="Bot is Running.")
 
 async def start_web():
-    debug_log(f"🌍 Starting Web Server on Port {PORT}")
+    debug_log(f"🌍 Web Server Port {PORT}")
     app_web = web.Application()
     app_web.add_routes([web.get('/', web_handler)])
     runner = web.AppRunner(app_web)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    debug_log("✅ Web Server Running!")
 
-# --- MAIN LOOP ---
 async def main():
-    # 1. Start Web Server DULUAN (Supaya Render senang)
     await start_web()
-    
-    # 2. Start Bot Telegram (Pakai try-except agar web server tidak ikut mati jika bot gagal)
-    debug_log("🤖 Starting Telegram Client...")
+    debug_log("🤖 Starting Telegram...")
     try:
         await app.start()
-        
-        # Pancing Cache Dialogs
-        debug_log("📚 Refreshing Cache...")
+        debug_log("📚 Refresh Cache...")
         async for d in app.get_dialogs(limit=20): pass
-        
-        debug_log("✅ TELEGRAM LOGIN SUCCESS!")
-        
-        # Coba kirim pesan ke channel
-        try:
-            await app.send_message(CMD_CHANNEL_ID, "✅ **Bot Hidup Kembali!**")
-        except Exception as e:
-            debug_log(f"⚠️ Gagal kirim pesan awal: {e}")
-
-        # Masuk mode Idle (Tunggu perintah)
+        debug_log("✅ READY!")
+        try: await app.send_message(CMD_CHANNEL_ID, "✅ **Bot Siap! (Versi Anti-Error 500)**")
+        except: pass
         await idle()
-        
     except Exception as e:
-        debug_log(f"❌ TELEGRAM ERROR: {e}")
-        debug_log("⚠️ Bot gagal login, tapi Web Server tetap jalan agar log bisa dibaca.")
-        
-        # Loop abadi supaya Render TIDAK mematikan service
-        # Ini kunci agar Anda bisa baca log errornya!
-        while True:
-            await asyncio.sleep(3600)
+        debug_log(f"❌ ERROR: {e}")
+        while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
