@@ -244,6 +244,10 @@ async def copy_cmd(client, message):
         await message.reply("⏳ Proses sedang berjalan. Tunggu selesai atau restart service.")
         return
 
+@app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/ping"))
+async def ping_cmd(client, message):
+    await message.reply("🏓 Pong! Bot aktif dan terhubung ke Telegram.\n✅ Siap menerima perintah /copy.")
+    
     text = message.text
     lines = text.strip().split("\n")[1:]  # Skip "/copy"
 
