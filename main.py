@@ -2,11 +2,10 @@ import os
 import asyncio
 import gc
 import time
-import re
 import random
 import sys
 import signal
-from urllib.parse_protected import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs  # ✅ DIPERBAIKI: bukan parse_protected!
 
 from pyrogram import Client, enums, errors, filters
 from pyrogram.handlers import MessageHandler
@@ -29,18 +28,18 @@ def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 def parse_telegram_link(url):
-    url = url.strip().replace(" ", "")  # Fix spasi di "https://t.me/ "
+    url = url.strip().replace(" ", "")  # Fix: hapus spasi berlebih
     if url.startswith("https://t.me/"):
         if "/c/" in url:
             # Format: https://t.me/c/123456789/100
-            parts = url.split("/")[4:]  # skip ['https:', '', 't.me', 'c']
+            parts = url.split("/")[4:]
             if len(parts) >= 2:
                 chat_id = int(f"-100{parts[0]}")
                 msg_id = int(parts[1])
                 return chat_id, msg_id
         else:
             # Format: https://t.me/username/100
-            parts = url.split("/")[3:]  # skip ['https:', '', 't.me']
+            parts = url.split("/")[3:]
             if len(parts) >= 2:
                 username = parts[0]
                 msg_id = int(parts[1])
@@ -67,7 +66,7 @@ def parse_range(range_str, default_min=20, default_max=40):
     except:
         return default_min, default_max
 
-# ===== HANDLER FUNCTIONS =====
+# ===== COMMAND HANDLERS =====
 async def copy_cmd(client, message):
     global COPY_JOB
     if COPY_JOB:
@@ -124,8 +123,10 @@ async def copy_cmd(client, message):
         await message.reply(f"❌ Error parsing: {e}")
         log(f"Parsing error: {e}")
 
+
 async def ping_cmd(client, message):
     await message.reply("🏓 Pong! Bot aktif dan terhubung ke Telegram.\n✅ Siap menerima perintah /copy.")
+
 
 async def hai_cmd(client, message):
     await message.reply("Siap kerja lembur bagai kuda, bossku! 🐴💪")
@@ -199,7 +200,7 @@ async def update_progress(current, total, to_chat, thread_id, min_delay, max_del
         chat_title = "Unknown"
         try:
             chat = await app.get_chat(to_chat)
-            chat_title = getattr(chat, "username", str(to_chat))
+            chat_title = getattr(chat, "title", getattr(chat, "username", str(to_chat)))
         except:
             pass
 
@@ -207,7 +208,7 @@ async def update_progress(current, total, to_chat, thread_id, min_delay, max_del
         text = (
             f"📥 Copy progres: {progress}\n"
             f"⏱️ Jeda: {min_delay}–{max_delay} detik | Batch: {batch_size}\n"
-            f"📤 Tujuan: @{chat_title}{thread_info}\n"
+            f"📤 Tujuan: {chat_title}{thread_info}\n"
             f"⏳ Estimasi: ~{est_minutes} menit\n"
             f"🔄 Terakhir: Pesan ID {current}"
         )
@@ -224,6 +225,7 @@ async def update_progress(current, total, to_chat, thread_id, min_delay, max_del
     except Exception as e:
         log(f"⚠️ Gagal update progres: {e}")
 
+
 async def keep_alive():
     while running:
         try:
@@ -231,6 +233,7 @@ async def keep_alive():
         except:
             pass
         await asyncio.sleep(20)
+
 
 async def copy_worker():
     global COPY_JOB, LOG_MESSAGE_ID
@@ -288,7 +291,7 @@ async def copy_worker():
         else:
             await asyncio.sleep(5)
 
-# ===== DUMMY SERVER =====
+# ===== HEALTH CHECK (Wajib untuk Render Web Service) =====
 async def healthcheck(request):
     return web.Response(text="OK", content_type="text/plain")
 
@@ -299,7 +302,6 @@ def graceful_shutdown():
         return
     running = False
     log("🛑 Received stop signal. Shutting down gracefully...")
-    # Stop asyncio loop and Pyrogram client in background task
     asyncio.create_task(shutdown_procedure())
 
 async def shutdown_procedure():
@@ -310,10 +312,9 @@ async def shutdown_procedure():
     except Exception as e:
         log(f"⚠️ Error during shutdown: {e}")
     finally:
-        # Force exit after cleanup
         os._exit(0)
 
-# ===== MAIN =====
+# ===== MAIN APP =====
 async def main():
     global app
     app = Client(
@@ -332,7 +333,7 @@ async def main():
     except Exception as e:
         log(f"⚠️ Gagal preload dialogs: {e}")
 
-    # Daftarkan handler
+    # Register handlers
     app.add_handler(MessageHandler(copy_cmd, filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/copy")))
     app.add_handler(MessageHandler(ping_cmd, filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/ping")))
     app.add_handler(MessageHandler(hai_cmd,  filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/hai")))
@@ -341,7 +342,7 @@ async def main():
     asyncio.create_task(copy_worker())
     asyncio.create_task(keep_alive())
 
-    # Web server untuk Render (wajib di Web Service)
+    # Web server for Render (keeps free instance awake)
     web_app = web.Application()
     web_app.router.add_get("/", healthcheck)
     runner = web.AppRunner(web_app)
@@ -351,7 +352,6 @@ async def main():
     await site.start()
     log(f"🌐 Web server running on port {port}")
 
-    # Keep alive forever (until SIGTERM)
     while running:
         await asyncio.sleep(30)
 
