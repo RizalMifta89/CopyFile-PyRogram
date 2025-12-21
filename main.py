@@ -2,10 +2,10 @@ import os
 import asyncio
 import gc
 import time
+import re
 import random
 import sys
-import signal
-from urllib.parse import urlparse, parse_qs  # ✅ DIPERBAIKI: bukan parse_protected!
+from urllib.parse import urlparse, parse_qs
 
 from pyrogram import Client, enums, errors, filters
 from pyrogram.handlers import MessageHandler
@@ -21,25 +21,26 @@ CMD_CHANNEL_ID = int(os.getenv("CMD_CHANNEL_ID"))
 COPY_JOB = None
 LOG_MESSAGE_ID = None
 app = None
-running = True
 
 # ===== UTILS =====
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 def parse_telegram_link(url):
-    url = url.strip().replace(" ", "")  # Fix: hapus spasi berlebih
+    url = url.strip()
     if url.startswith("https://t.me/"):
+        parsed = urlparse(url)
+        path = parsed.path.lstrip("/")
+        query = parse_qs(parsed.query)
+
         if "/c/" in url:
-            # Format: https://t.me/c/123456789/100
-            parts = url.split("/")[4:]
+            parts = path.split("/")[1:]
             if len(parts) >= 2:
                 chat_id = int(f"-100{parts[0]}")
                 msg_id = int(parts[1])
                 return chat_id, msg_id
         else:
-            # Format: https://t.me/username/100
-            parts = url.split("/")[3:]
+            parts = path.split("/")
             if len(parts) >= 2:
                 username = parts[0]
                 msg_id = int(parts[1])
@@ -55,6 +56,7 @@ def extract_thread_id(url):
     return None
 
 def parse_range(range_str, default_min=20, default_max=40):
+    """Parse 'a-b' menjadi (min, max), aman terhadap spasi dan format salah."""
     try:
         clean = range_str.replace(" ", "")
         parts = clean.split("-")
@@ -66,7 +68,7 @@ def parse_range(range_str, default_min=20, default_max=40):
     except:
         return default_min, default_max
 
-# ===== COMMAND HANDLERS =====
+# ===== HANDLER FUNCTIONS =====
 async def copy_cmd(client, message):
     global COPY_JOB
     if COPY_JOB:
@@ -88,6 +90,7 @@ async def copy_cmd(client, message):
         to_chat, _ = parse_telegram_link(config["tujuan"])
         thread_id = extract_thread_id(config["tujuan"])
 
+        # Parsing jeda dan jeda_batch dengan fungsi aman
         min_delay, max_delay = parse_range(config.get("jeda", "3-7"), 3, 7)
         batch = int(config.get("batch", "10"))
         min_batch_delay, max_batch_delay = parse_range(config.get("jeda_batch", "20-40"), 20, 40)
@@ -100,6 +103,7 @@ async def copy_cmd(client, message):
             "only_media": config.get("only_media", "false").lower() == "true",
         }
 
+        global COPY_JOB
         COPY_JOB = {
             "from_chat": from_chat,
             "to_chat": to_chat,
@@ -115,7 +119,7 @@ async def copy_cmd(client, message):
             "filters": filters_dict
         }
 
-        await message.reply("🟢 Mulai proses copy...\nProgres akan dikirim di sini.")
+        await message.reply("🟢 Mulai proses copy...\nSaya akan kirim progres di sini.")
         global LOG_MESSAGE_ID
         LOG_MESSAGE_ID = None
 
@@ -123,13 +127,8 @@ async def copy_cmd(client, message):
         await message.reply(f"❌ Error parsing: {e}")
         log(f"Parsing error: {e}")
 
-
 async def ping_cmd(client, message):
     await message.reply("🏓 Pong! Bot aktif dan terhubung ke Telegram.\n✅ Siap menerima perintah /copy.")
-
-
-async def hai_cmd(client, message):
-    await message.reply("Siap kerja lembur bagai kuda, bossku! 🐴💪")
 
 # ===== SAFE COPY FUNCTION =====
 async def safe_copy_message(from_chat, msg_id, to_chat, thread_id=None, filters=None):
@@ -200,7 +199,7 @@ async def update_progress(current, total, to_chat, thread_id, min_delay, max_del
         chat_title = "Unknown"
         try:
             chat = await app.get_chat(to_chat)
-            chat_title = getattr(chat, "title", getattr(chat, "username", str(to_chat)))
+            chat_title = getattr(chat, "username", str(to_chat))
         except:
             pass
 
@@ -208,7 +207,7 @@ async def update_progress(current, total, to_chat, thread_id, min_delay, max_del
         text = (
             f"📥 Copy progres: {progress}\n"
             f"⏱️ Jeda: {min_delay}–{max_delay} detik | Batch: {batch_size}\n"
-            f"📤 Tujuan: {chat_title}{thread_info}\n"
+            f"📤 Tujuan: @{chat_title}{thread_info}\n"
             f"⏳ Estimasi: ~{est_minutes} menit\n"
             f"🔄 Terakhir: Pesan ID {current}"
         )
@@ -225,19 +224,17 @@ async def update_progress(current, total, to_chat, thread_id, min_delay, max_del
     except Exception as e:
         log(f"⚠️ Gagal update progres: {e}")
 
-
 async def keep_alive():
-    while running:
+    while True:
         try:
             await app.send_chat_action("me", enums.ChatAction.TYPING)
         except:
             pass
         await asyncio.sleep(20)
 
-
 async def copy_worker():
     global COPY_JOB, LOG_MESSAGE_ID
-    while running:
+    while True:
         if COPY_JOB:
             job = COPY_JOB
             current = job["current"]
@@ -291,30 +288,11 @@ async def copy_worker():
         else:
             await asyncio.sleep(5)
 
-# ===== HEALTH CHECK (Wajib untuk Render Web Service) =====
+# ===== DUMMY SERVER =====
 async def healthcheck(request):
     return web.Response(text="OK", content_type="text/plain")
 
-# ===== GRACEFUL SHUTDOWN =====
-def graceful_shutdown():
-    global running
-    if not running:
-        return
-    running = False
-    log("🛑 Received stop signal. Shutting down gracefully...")
-    asyncio.create_task(shutdown_procedure())
-
-async def shutdown_procedure():
-    try:
-        if app and app.is_connected:
-            await app.stop()
-            log("🔌 Pyrogram client stopped.")
-    except Exception as e:
-        log(f"⚠️ Error during shutdown: {e}")
-    finally:
-        os._exit(0)
-
-# ===== MAIN APP =====
+# ===== MAIN =====
 async def main():
     global app
     app = Client(
@@ -333,16 +311,23 @@ async def main():
     except Exception as e:
         log(f"⚠️ Gagal preload dialogs: {e}")
 
-    # Register handlers
-    app.add_handler(MessageHandler(copy_cmd, filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/copy")))
-    app.add_handler(MessageHandler(ping_cmd, filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/ping")))
-    app.add_handler(MessageHandler(hai_cmd,  filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/hai")))
+    # Daftarkan handler
+    copy_handler = MessageHandler(
+        copy_cmd,
+        filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/copy")
+    )
+    ping_handler = MessageHandler(
+        ping_cmd,
+        filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/ping")
+    )
+    app.add_handler(copy_handler)
+    app.add_handler(ping_handler)
 
-    # Start background tasks
+    # Start tasks
     asyncio.create_task(copy_worker())
     asyncio.create_task(keep_alive())
 
-    # Web server for Render (keeps free instance awake)
+    # Web server
     web_app = web.Application()
     web_app.router.add_get("/", healthcheck)
     runner = web.AppRunner(web_app)
@@ -352,17 +337,17 @@ async def main():
     await site.start()
     log(f"🌐 Web server running on port {port}")
 
-    while running:
-        await asyncio.sleep(30)
+    while True:
+        await asyncio.sleep(3600)
 
-# ===== SIGNAL HANDLERS =====
-signal.signal(signal.SIGTERM, lambda s, f: graceful_shutdown())
-signal.signal(signal.SIGINT,  lambda s, f: graceful_shutdown())
-
-# ===== ENTRY POINT =====
+# ===== ENTRY =====
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        log("🛑 Stopped by user")
     except Exception as e:
         log(f"💥 Fatal error: {e}")
         sys.exit(1)
