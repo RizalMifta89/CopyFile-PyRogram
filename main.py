@@ -101,7 +101,6 @@ async def copy_cmd(client, message):
             "only_media": config.get("only_media", "false").lower() == "true",
         }
 
-        global COPY_JOB
         COPY_JOB = {
             "from_chat": from_chat,
             "to_chat": to_chat,
