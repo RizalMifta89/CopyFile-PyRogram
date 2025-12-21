@@ -55,19 +55,6 @@ def extract_thread_id(url):
         return int(thread[0])
     return None
 
-def parse_range(range_str, default_min=20, default_max=40):
-    """Parse 'a-b' menjadi (min, max), aman terhadap spasi dan format salah."""
-    try:
-        clean = range_str.replace(" ", "")
-        parts = clean.split("-")
-        if len(parts) == 2:
-            a, b = int(parts[0]), int(parts[1])
-            return min(a, b), max(a, b)
-        else:
-            return default_min, default_max
-    except:
-        return default_min, default_max
-
 # ===== HANDLER FUNCTIONS =====
 async def copy_cmd(client, message):
     global COPY_JOB
@@ -90,10 +77,16 @@ async def copy_cmd(client, message):
         to_chat, _ = parse_telegram_link(config["tujuan"])
         thread_id = extract_thread_id(config["tujuan"])
 
-        # Parsing jeda dan jeda_batch dengan fungsi aman
-        min_delay, max_delay = parse_range(config.get("jeda", "3-7"), 3, 7)
+        # Parsing jeda dengan hapus spasi
+        jeda = config.get("jeda", "3-7").replace(" ", "")
+        jeda_parts = list(map(int, jeda.split("-")))
+        min_delay, max_delay = jeda_parts[0], jeda_parts[1]
+
         batch = int(config.get("batch", "10"))
-        min_batch_delay, max_batch_delay = parse_range(config.get("jeda_batch", "20-40"), 20, 40)
+
+        jeda_batch = config.get("jeda_batch", "20-40").replace(" ", "")
+        jeda_batch_parts = list(map(int, jeda_batch.split("-")))
+        min_batch_delay, max_batch_delay = jeda_batch_parts[0], jeda_batch_parts[1]
 
         filters_dict = {
             "skip_sticker": config.get("skip_sticker", "true").lower() == "true",
