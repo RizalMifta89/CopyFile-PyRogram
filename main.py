@@ -9,13 +9,6 @@ from urllib.parse import urlparse, parse_qs
 
 from pyrogram import Client, enums, errors
 from aiohttp import web
-import uvloop
-
-# Install uvloop for better performance (if available)
-try:
-    uvloop.install()
-except Exception:
-    pass
 
 # ===== ENVIRONMENT VARIABLES =====
 API_ID = int(os.getenv("API_ID"))
@@ -26,7 +19,7 @@ CMD_CHANNEL_ID = int(os.getenv("CMD_CHANNEL_ID"))
 # ===== GLOBAL STATE =====
 COPY_JOB = None
 LOG_MESSAGE_ID = None  # ID pesan log di CMD_CHANNEL_ID
-app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+app = None  # Akan diinisialisasi di dalam main()
 
 # ===== UTILS =====
 def log(msg):
@@ -244,10 +237,6 @@ async def copy_cmd(client, message):
         await message.reply("⏳ Proses sedang berjalan. Tunggu selesai atau restart service.")
         return
 
-@app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/ping"))
-async def ping_cmd(client, message):
-    await message.reply("🏓 Pong! Bot aktif dan terhubung ke Telegram.\n✅ Siap menerima perintah /copy.")
-    
     text = message.text
     lines = text.strip().split("\n")[1:]  # Skip "/copy"
 
@@ -305,12 +294,25 @@ async def ping_cmd(client, message):
         await message.reply(f"❌ Error parsing: {e}")
         log(f"Parsing error: {e}")
 
+@app.on_message(filters.chat(CMD_CHANNEL_ID) & filters.regex(r"^/ping"))
+async def ping_cmd(client, message):
+    await message.reply("🏓 Pong! Bot aktif dan terhubung ke Telegram.\n✅ Siap menerima perintah /copy.")
+
 # ===== DUMMY WEB SERVER (for Render) =====
 async def healthcheck(request):
     return web.Response(text="OK", content_type="text/plain")
 
 # ===== MAIN =====
 async def main():
+    global app
+    # Inisialisasi Client di dalam event loop
+    app = Client(
+        "userbot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=SESSION_STRING
+    )
+
     # Start Pyrogram
     await app.start()
     log("✅ Userbot started")
@@ -340,9 +342,9 @@ async def main():
     while True:
         await asyncio.sleep(3600)
 
+# ===== ENTRY POINT =====
 if __name__ == "__main__":
     try:
-        # Solusi untuk Render.com: gunakan explicit event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(main())
