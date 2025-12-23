@@ -39,7 +39,8 @@ app = Client(
     "render_bot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    sleep_threshold=3600  # Allow auto-sleep for floodwait up to 1 hour
 )
 
 IS_WORKING = False
@@ -47,7 +48,7 @@ STOP_EVENT = asyncio.Event()
 
 DEFAULT_BATCH_SIZE = 10000  # Nilai tinggi untuk efisiensi pada bot API
 DEFAULT_BATCH_TIME = 60
-DEFAULT_CHUNK_SIZE = 20  # Default Ember Size
+DEFAULT_CHUNK_SIZE = 50  # Tingkatkan default untuk fetch lebih efisien
 DEFAULT_SPEED = 0.1
 
 class FilterType(Enum):
@@ -276,12 +277,14 @@ async def copy_worker(job: Dict, status_msg):
                         break
 
                     except FloodWait as e:
+                        logger.info(f"FloodWait: Sleeping for {e.value} seconds")
                         await status_msg.edit(f"🌊 **Kena Limit Telegram!**\nTunggu {e.value} detik...")
                         await asyncio.sleep(e.value + 10)  # Tambah buffer
                         # Continue tanpa increment retry_idx
                     
                     except RPCError as e:
                         last_error_log = str(e)
+                        logger.warning(f"RPCError in copy: {e}")
                         if "500" in str(e) or "INTERDC" in str(e):
                             await asyncio.sleep(10)
                         else:
