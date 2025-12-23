@@ -47,6 +47,7 @@ class FilterType(Enum):
     FOTO = 'foto'
     DOKUMEN = 'dokumen'
     AUDIO = 'audio'
+    ALLOUT = 'allout'  # Baru: tanpa filter apapun
 
 # --- 1. HELPER: FORMAT WAKTU (ETA) ---
 def format_time(seconds: float) -> str:
@@ -160,7 +161,7 @@ def validate_config(config: Dict) -> Tuple[bool, str]:
             return False, "Batch/Ember values must be positive"
         
     except ValueError:
-        return False, f"Invalid filter type: {filter_str}. Pilihan: all, video, foto, dokumen, audio"
+        return False, f"Invalid filter type: {filter_str}. Pilihan: all, video, foto, dokumen, audio, allout"
     
     return True, ""
 
@@ -238,6 +239,8 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                 elif filter_type == FilterType.AUDIO and (msg.audio or msg.voice):
                     should_copy = True
                 elif filter_type == FilterType.ALL and not msg.sticker:
+                    should_copy = True
+                elif filter_type == FilterType.ALLOUT:
                     should_copy = True
                 
                 if not should_copy:
