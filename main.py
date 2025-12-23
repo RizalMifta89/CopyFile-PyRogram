@@ -23,60 +23,24 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-logger.info("--- SYSTEM BOOT: V9.1 OPTIMIZED SMART CHUNKING EDITION (MULTI-BOT VERSION) ---")
+logger.info("--- SYSTEM BOOT: V9.3 OPTIMIZED SMART CHUNKING EDITION (MULTI-BOT TOKEN VERSION) ---")
 
-# --- LOAD BOTS FROM ENV ---
-def load_bots_config():
-    bots = []
-    for i in range(1, 6):  # Bot1 to Bot5
-        api_id = os.environ.get(f"BOT{i}_API_ID")
-        api_hash = os.environ.get(f"BOT{i}_API_HASH")
-        bot_token = os.environ.get(f"BOT{i}_BOT_TOKEN")
-        
-        if api_id and api_hash and bot_token:
-            try:
-                api_id = int(api_id)
-                bots.append({
-                    "id": i,
-                    "name": f"Bot{i}",
-                    "api_id": api_id,
-                    "api_hash": api_hash,
-                    "bot_token": bot_token,
-                    "start_cmd": f"start{i}",
-                    "stop_cmd": f"stop{i}",
-                    "is_working": False,
-                    "stop_event": asyncio.Event(),
-                })
-            except ValueError:
-                logger.error(f"❌ BOT{i}_API_ID must be integer!")
-        else:
-            logger.info(f"ℹ️ BOT{i} not configured (missing env).")
-    return bots
+# --- KONFIGURASI MULTI-BOT ---
+NUM_BOTS = 5
+clients = []
+bot_data = []  # List of dicts for each bot: {'client': Client, 'is_working': False, 'stop_event': asyncio.Event(), 'logger': logger}
 
-# Initialize bots
-BOTS = load_bots_config()
-
-if not BOTS:
-    logger.error("❌ No valid bots found in environment! Please set BOT1_* ... BOT5_*")
-    sys.exit(1)
-
-# Create Pyrogram clients
-for bot in BOTS:
-    bot["client"] = Client(
-        bot["name"].lower(),
-        api_id=bot["api_id"],
-        api_hash=bot["api_hash"],
-        bot_token=bot["bot_token"]
-    )
-
-# --- CONFIGURATION ---
 try:
     PORT = int(os.environ.get("PORT", 8080))
 except ValueError as e:
-    logger.error(f"❌ PORT config error: {e}")
+    logger.error(f"❌ Config Error: {e}")
     sys.exit(1)
 
-# --- ENUM & DEFAULTS ---
+DEFAULT_BATCH_SIZE = 10000  # Nilai tinggi untuk efisiensi pada bot API
+DEFAULT_BATCH_TIME = 60
+DEFAULT_CHUNK_SIZE = 50  # Tingkatkan default untuk fetch lebih efisien
+DEFAULT_SPEED = 0.1
+
 class FilterType(Enum):
     ALL = 'all'
     VIDEO = 'video'
@@ -84,12 +48,7 @@ class FilterType(Enum):
     DOKUMEN = 'dokumen'
     AUDIO = 'audio'
 
-DEFAULT_BATCH_SIZE = 50
-DEFAULT_BATCH_TIME = 60
-DEFAULT_CHUNK_SIZE = 20  # Default Ember Size
-DEFAULT_SPEED = 0.1
-
-# --- HELPER FUNCTIONS (UNCHANGED) ---
+# --- 1. HELPER: FORMAT WAKTU (ETA) ---
 def format_time(seconds: float) -> str:
     if seconds < 60:
         return f"{int(seconds)} detik"
@@ -102,6 +61,7 @@ def format_time(seconds: float) -> str:
         minutes = int((seconds % 3600) // 60)
         return f"{hours} jam {minutes} menit"
 
+# --- 2. LOGIKA TRAFFIC LIGHT ---
 def get_system_status(delay_avg: float = 0) -> Tuple[float, str, float, str]:
     try:
         proc = psutil.Process(os.getpid())
@@ -139,7 +99,8 @@ def make_bar(current: int, total: int, length: int = 10) -> str:
     bar = "🟧" * filled + "⬜" * (length - filled)
     return f"{bar} **{int(pct * 100)}%**"
 
-def parse_link(link: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
+# --- 3. PARSE LINK ---
+def parse_link(link: Optional[str]) -> Tuple[Optional[any], Optional[int]]:  # src_chat bisa str atau int
     if not link:
         return None, None
     private_match = re.search(r"t\.me/c/(\d+)/(\d+)", link)
@@ -150,6 +111,7 @@ def parse_link(link: Optional[str]) -> Tuple[Optional[str], Optional[int]]:
         return public_match.group(1), int(public_match.group(2))
     return None, None
 
+# --- 4. PARSE CONFIG FROM COMMAND (OPTIMIZED WITH REGEX, TAMBAH BATCH & EMBER) ---
 def parse_config(text: str) -> Dict:
     config = {}
     patterns = {
@@ -158,23 +120,24 @@ def parse_config(text: str) -> Dict:
         'dst': r"tujuan:\s*(.+)",
         'speed': r"speed:\s*(\d+\.?\d*)",
         'filter_type': r"filter:\s*(\w+)",
-        'chunk_size': r"ember:\s*(\d+)",
-        'batch_size': r"batch_size:\s*(\d+)",
-        'batch_time': r"batch_time:\s*(\d+)",
+        'batch_size': r"batch_size:\s*(\d+)",  # Baru: untuk set batch size
+        'batch_time': r"batch_time:\s*(\d+)",  # Baru: untuk set batch time
+        'ember': r"ember:\s*(\d+)"  # Baru: untuk set chunk_size (ember)
     }
     
     for key, pattern in patterns.items():
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            if key in ('speed',):
+            if key in ['speed']:
                 config[key] = float(match.group(1))
-            elif key in ('chunk_size', 'batch_size', 'batch_time'):
+            elif key in ['batch_size', 'batch_time', 'ember']:
                 config[key] = int(match.group(1))
             else:
                 config[key] = match.group(1).strip().lower() if key == 'filter_type' else match.group(1).strip()
     
     return config
 
+# --- 5. VALIDATE CONFIG ---
 def validate_config(config: Dict) -> Tuple[bool, str]:
     required = ['src_start', 'src_end', 'dst']
     for req in required:
@@ -186,27 +149,30 @@ def validate_config(config: Dict) -> Tuple[bool, str]:
         if config['delay_min'] <= 0:
             return False, "Speed must be positive"
         
-        config['filter_type'] = FilterType(config.get('filter_type', 'all'))
+        filter_str = config.get('filter_type', 'all')
+        config['filter_type'] = FilterType(filter_str)
+        
         config['batch_size'] = config.get('batch_size', DEFAULT_BATCH_SIZE)
         config['batch_time'] = config.get('batch_time', DEFAULT_BATCH_TIME)
-        config['chunk_size'] = config.get('chunk_size', DEFAULT_CHUNK_SIZE)
+        config['chunk_size'] = config.get('ember', DEFAULT_CHUNK_SIZE)
+        
+        if config['batch_size'] <= 0 or config['batch_time'] < 0 or config['chunk_size'] <= 0:
+            return False, "Batch/Ember values must be positive"
         
     except ValueError:
-        return False, "Invalid filter type or number"
+        return False, f"Invalid filter type: {filter_str}. Pilihan: all, video, foto, dokumen, audio"
     
     return True, ""
 
-# --- WORKER UTAMA (DIPERTAHANKAN, HANYA TAMBAH PREFIX BOT) ---
-async def copy_worker(job: Dict, status_msg, bot_info):
-    bot_name = bot_info["name"]
-    stop_event = bot_info["stop_event"]
-    bot_info["is_working"] = True
-    stop_event.clear()
+# --- 6. WORKER UTAMA (SMART CHUNKING / EMBER) ---
+async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logger):
+    bot_data[bot_id]['is_working'] = True
+    bot_data[bot_id]['stop_event'].clear()
     
     start_id: int = job['start_id']
     end_id: int = job['end_id']
-    src_chat: str = job['src_chat']
-    dst_chat: str = job['dst_chat']
+    src_chat: any = job['src_chat']  # Bisa str atau int
+    dst_chat: any = job['dst_chat']
     
     batch_size: int = job['batch_size']
     batch_time: int = job['batch_time']
@@ -217,48 +183,51 @@ async def copy_worker(job: Dict, status_msg, bot_info):
     delay_avg: float = delay_min + 0.25
     
     stats = {'success': 0, 'failed': 0, 'total': end_id - start_id + 1}
-    processed_count = 0
+    processed_count = 0  # Success count for batch sleep
     last_update_time = time.time()
     last_error_log = "-"
 
     try:
         for chunk_start in range(start_id, end_id + 1, chunk_size):
-            if stop_event.is_set():
+            if bot_data[bot_id]['stop_event'].is_set():
                 break
 
             chunk_end = min(chunk_start + chunk_size - 1, end_id)
             ids_to_fetch = list(range(chunk_start, chunk_end + 1))
             
             messages_batch = []
-            fetch_retries = 3
+            fetch_retries = 5  # Tingkatkan retry untuk stabilitas
             for retry in range(fetch_retries):
                 try:
-                    messages_batch = await bot_info["client"].get_messages(src_chat, ids_to_fetch)
+                    messages_batch = await app.get_messages(src_chat, ids_to_fetch)
                     break
                 except Exception as e:
-                    logger.warning(f"[{bot_name}] ⚠️ Fetch chunk {chunk_start}-{chunk_end} failed (retry {retry+1}/{fetch_retries}): {e}")
+                    last_error_log = str(e)
+                    bot_logger.warning(f"⚠️ Fetch chunk {chunk_start}-{chunk_end} failed (retry {retry+1}/{fetch_retries}): {e}")
                     if retry == fetch_retries - 1:
                         stats['failed'] += len(ids_to_fetch)
-                        last_error_log = str(e)
                         continue
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(5)  # Backoff lebih panjang
 
             if not messages_batch:
                 continue
 
             for msg in messages_batch:
-                if stop_event.is_set():
+                if bot_data[bot_id]['stop_event'].is_set():
                     break
                 
+                # --- LOGIKA BATCH SLEEP (ISTIRAHAT PANJANG) ---
                 if processed_count > 0 and processed_count % batch_size == 0:
-                    await status_msg.edit(f"😴 **[{bot_name}] SEDANG ISTIRAHAT BATCH ({batch_time}s)...**\n\n❄️ Mendinginkan Mesin...")
+                    await status_msg.edit(f"😴 **SEDANG ISTIRAHAT BATCH ({batch_time}s)...**\n\n❄️ Mendinginkan Mesin...")
                     await asyncio.sleep(batch_time)
                     last_update_time = time.time()
 
+                # Cek Validitas Pesan
                 if not msg or msg.empty or msg.service:
                     stats['failed'] += 1
                     continue
 
+                # --- FILTERING ---
                 should_copy = False
                 if filter_type == FilterType.VIDEO and msg.video:
                     should_copy = True
@@ -275,9 +244,11 @@ async def copy_worker(job: Dict, status_msg, bot_info):
                     stats['failed'] += 1
                     continue
 
-                max_retries = 5
+                # --- EKSEKUSI COPY (DENGAN RETRY LOOP) ---
+                max_retries = 10  # Tingkatkan retry untuk hindari macet
+                msg_success = False
                 for retry_idx in range(max_retries):
-                    if stop_event.is_set():
+                    if bot_data[bot_id]['stop_event'].is_set():
                         break
                     try:
                         copy_params = {'chat_id': dst_chat}
@@ -288,106 +259,108 @@ async def copy_worker(job: Dict, status_msg, bot_info):
                         
                         stats['success'] += 1
                         processed_count += 1
+                        msg_success = True
+                        
+                        # Jeda aman per pesan (float)
                         await asyncio.sleep(random.uniform(delay_min, delay_min + 0.5))
                         break
 
                     except FloodWait as e:
-                        await status_msg.edit(f"🌊 **[{bot_name}] Kena Limit Telegram!**\nTunggu {e.value} detik...")
-                        await asyncio.sleep(e.value + 5)
+                        bot_logger.info(f"FloodWait: Sleeping for {e.value} seconds")
+                        await status_msg.edit(f"🌊 **Kena Limit Telegram!**\nTunggu {e.value} detik...")
+                        await asyncio.sleep(e.value + 10)  # Tambah buffer
+                        # Continue tanpa increment retry_idx
+                    
                     except RPCError as e:
                         last_error_log = str(e)
+                        bot_logger.warning(f"RPCError in copy: {e}")
                         if "500" in str(e) or "INTERDC" in str(e):
-                            await asyncio.sleep(5)
+                            await asyncio.sleep(10)
                         else:
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(5)
                     except Exception as e:
                         last_error_log = str(e)
-                        logger.error(f"[{bot_name}] Unexpected error in copy: {e}")
-                        break
-                else:
+                        bot_logger.error(f"Unexpected error in copy: {e}")
+                        await asyncio.sleep(5)
+
+                if not msg_success:
                     stats['failed'] += 1
 
+                # --- UPDATE TAMPILAN STATUS (PERBAIKI UNTUK LEBIH RINGKAS) ---
                 if time.time() - last_update_time > 10:
                     current_proc = stats['success'] + stats['failed']
                     remaining_files = stats['total'] - current_proc
+                    
                     eta_val = (remaining_files * delay_avg) + ((remaining_files // batch_size) * batch_time)
                     eta_text = format_time(eta_val)
+
                     bar_str = make_bar(current_proc, stats['total'])
                     cpu_val, cpu_txt, ram_val, speed_txt = get_system_status(delay_avg)
                     
                     text = (
-                        f"🐎 **[{bot_name}] WORKHORSE V9.1: OPTIMIZED SMART CHUNKING**\n"
+                        f"🐎 **WORKHORSE V9.3: OPTIMIZED SMART CHUNKING (BOT VERSION)**\n"
                         f"{bar_str}\n\n"
-                        f"📊 **Logistik Kargo:**\n"
-                        f"• 📥 Total: `{stats['total']}`  |  ✅ Sukses: `{stats['success']}`\n"
-                        f"• 🗑 Gagal: `{stats['failed']}`  |  ⏳ Sisa: `{remaining_files}`\n"
-                        f"• 🏁 Estimasi: `± {eta_text}`\n"
-                        f"• 🔍 Filter: `{filter_type.value.upper()}`\n\n"
-                        f"🌡️ **Resource Bot:**\n"
-                        f"• 🧠 CPU: {cpu_val}% [{cpu_txt}]\n"
-                        f"• 💾 RAM: {ram_val:.2f} MB\n\n"
-                        f"⚡ **Konfigurasi:**\n"
-                        f"• 🪣 Ember: {chunk_size} pesan/tarik\n"
-                        f"• ⏱ Jeda: {delay_avg:.2f} detik\n"
-                        f"• {speed_txt}\n"
-                        f"• 🛡️ Batch: Istirahat {batch_time}s tiap {batch_size} file\n\n"
-                        f"🔄 *Update tiap 10 detik...*\n"
-                        f"⚠️ *Last Error: {last_error_log}*"
+                        f"📊 **Stats:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal `{stats['failed']}` | Sisa `{remaining_files}`\n"
+                        f"🏁 **ETA:** ± {eta_text} | Filter: `{filter_type.value.upper()}`\n\n"
+                        f"🌡️ **Resources:** CPU {cpu_val}% [{cpu_txt}] | RAM {ram_val:.2f} MB\n\n"
+                        f"⚡ **Config:** Ember {chunk_size} | Jeda {delay_avg:.2f}s | {speed_txt}\n"
+                        f"Batch: {batch_time}s tiap {batch_size} file\n\n"
+                        f"🔄 Update tiap 10s | ⚠️ Last Error: {last_error_log}"
                     )
                     try:
                         await status_msg.edit(text)
                         last_update_time = time.time()
                     except Exception as e:
-                        logger.warning(f"[{bot_name}] Failed to update status: {e}")
+                        bot_logger.warning(f"Failed to update status: {e}")
             
+            # Bersihkan memori setiap chunk selesai
             del messages_batch
             gc.collect()
 
-        final_msg = "✅ **SELESAI!**" if not stop_event.is_set() else "🛑 **DIBATALKAN!**"
+        # --- LAPORAN AKHIR ---
+        final_msg = "✅ **SELESAI!**" if not bot_data[bot_id]['stop_event'].is_set() else "🛑 **DIBATALKAN!**"
         await status_msg.edit(
-            f"[{bot_name}] {final_msg}\n\n"
-            f"📊 **Laporan Akhir:**\n"
-            f"• 📥 Total: `{stats['total']}`\n"
-            f"• ✅ Sukses: `{stats['success']}`\n"
-            f"• 🗑 Gagal/Skip: `{stats['failed']}`\n\n"
-            f"📝 **Log Error:** `{last_error_log}`"
+            f"{final_msg}\n\n"
+            f"📊 **Laporan Akhir:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal/Skip `{stats['failed']}`\n"
+            f"📝 **Last Error:** {last_error_log}"
         )
 
     except Exception as e:
-        logger.error(f"[{bot_name}] ❌ CRASH IN WORKER: {e}")
-        await status_msg.edit(f"[{bot_name}] ❌ **CRASH SYSTEM:** {e}")
+        bot_logger.error(f"❌ CRASH IN WORKER: {e}")
+        await status_msg.edit(f"❌ **CRASH SYSTEM:** {e}")
     finally:
-        bot_info["is_working"] = False
+        bot_data[bot_id]['is_working'] = False
 
-# --- REGISTER HANDLERS PER BOT ---
-def register_handlers(bot):
-    @bot["client"].on_message(filters.command(bot["start_cmd"]) & filters.group)
+# --- COMMANDS (PERBAIKI UNTUK LEBIH ROBUST) ---
+def register_handlers(app: Client, bot_id: int):
+    bot_logger = logging.getLogger(f"{__name__}.bot{bot_id}")
+    bot_logger.handlers = logger.handlers  # Share handlers
+    bot_logger.setLevel(logger.level)
+
+    if bot_id == 1:
+        start_commands = ["start", "start1"]
+    else:
+        start_commands = [f"start{bot_id}"]
+
+    @app.on_message(filters.command(start_commands) & filters.group)
     async def start_cmd(client, message):
-        if bot["is_working"]:
-            return await message.reply(f"⚠️ **[{bot['name']}] Sedang Sibuk!** `/{bot['stop_cmd']}` dulu.")
+        if bot_data[bot_id]['is_working']:
+            return await message.reply("⚠️ **Sedang Sibuk!** Gunakan `/stop` dulu.")
         
         try:
             config = parse_config(message.text)
             valid, error = validate_config(config)
             if not valid:
-                return await message.reply(f"❌ **Config Invalid:** {error}")
+                return await message.reply(f"❌ **Config Gagal:** {error}\nCoba cek format perintah.")
 
             src_chat, start_id = parse_link(config['src_start'])
             _, end_id = parse_link(config['src_end'])
             dst_chat, dst_topic = parse_link(config['dst'])
 
             if not src_chat or not dst_chat or not start_id or not end_id:
-                return await message.reply("❌ **Link Salah Format!**")
+                return await message.reply("❌ **Link Salah Format!** Pastikan link seperti https://t.me/c/1234/100.")
 
-            status_msg = await message.reply(f"🚑 **[{bot['name']}] Sedang Menyembuhkan Sesi...**")
-            try:
-                count = 0
-                async for dialog in bot["client"].get_dialogs(limit=50):
-                    count += 1
-                await status_msg.edit(f"✅ **[{bot['name']}] Sesi Pulih! (Memuat {count} chat)**\n🐎 **Menyiapkan Kuda...**")
-            except Exception as e:
-                logger.warning(f"[{bot['name']}] Gagal refresh dialog: {e}")
-                await status_msg.edit(f"⚠️ **[{bot['name']}] Gagal Refresh Sesi:** {e}\nTetap mencoba lanjut...")
+            status_msg = await message.reply("🐎 **Menyiapkan Proses Copy...**")
 
             job = {
                 'src_chat': src_chat, 
@@ -402,49 +375,78 @@ def register_handlers(bot):
                 'chunk_size': config['chunk_size']
             }
             
-            asyncio.create_task(copy_worker(job, status_msg, bot))
+            asyncio.create_task(copy_worker(job, status_msg, bot_id, client, bot_logger))
             
         except Exception as e:
-            logger.error(f"[{bot['name']}] ❌ Error in start_cmd: {e}")
-            await message.reply(f"❌ Error Config: {e}")
+            bot_logger.error(f"❌ Error in start_cmd: {e}")
+            await message.reply(f"❌ **Error Config:** {e}\nCoba cek env vars atau akses bot.")
 
-    @bot["client"].on_message(filters.command(bot["stop_cmd"]) & filters.group)
+    @app.on_message(filters.command("stop") & filters.group)
     async def stop_cmd(client, message):
-        if bot["is_working"]:
-            bot["stop_event"].set()
-            await message.reply(f"🛑 **[{bot['name']}] REM DARURAT DITARIK!**\nMenunggu proses terakhir selesai...")
+        if bot_data[bot_id]['is_working']:
+            bot_data[bot_id]['stop_event'].set()
+            await message.reply("🛑 **Proses Dihentikan!** Menunggu selesai...")
         else:
-            await message.reply(f"💤 **[{bot['name']}] sedang tidur.**")
+            await message.reply("💤 **Tidak Ada Proses Berjalan.**")
 
-    @bot["client"].on_message(filters.command(f"stats{bot['id']}") & filters.group)
+    @app.on_message(filters.command("stats") & filters.group)
     async def stats_cmd(client, message):
         cpu_val, cpu_txt, ram_val, _ = get_system_status(0)
-        status_bot = "🔥 SEDANG LEMBUR" if bot["is_working"] else "💤 SEDANG ISTIRAHAT"
+        status_bot = "🔥 Aktif" if bot_data[bot_id]['is_working'] else "💤 Istirahat"
         text = (
-            f"🐴 **[{bot['name']}] STATUS SERVER (V9.1)**\n"
+            f"🐴 **Status Server V9.3 (BOT {bot_id} VERSION)**\n"
             f"──────────────────\n"
             f"🤖 **Status:** {status_bot}\n"
-            f"🌡️ **Resource Bot:**\n"
-            f"• 🧠 CPU: {cpu_val}% [{cpu_txt}]\n"
-            f"• 💾 RAM: {ram_val:.2f} MB\n"
+            f"🧠 **CPU:** {cpu_val}% [{cpu_txt}]\n"
+            f"💾 **RAM:** {ram_val:.2f} MB\n"
             f"──────────────────"
         )
         await message.reply(text)
 
-    @bot["client"].on_message(filters.command(f"ping{bot['id']}") & filters.group)
+    @app.on_message(filters.command("ping") & filters.group)
     async def ping_cmd(client, message):
         start = time.time()
-        msg = await message.reply(f"🏓 **[{bot['name']}] Pong!**")
+        msg = await message.reply("🏓 **Pong!**")
         end = time.time()
-        await msg.edit(f"🏓 **[{bot['name']}] Pong!** `{(end - start) * 1000:.2f}ms`")
+        await msg.edit(f"🏓 **Pong!** Latency: `{(end - start) * 1000:.2f}ms`")
 
-# Register all
-for bot in BOTS:
-    register_handlers(bot)
+# --- INIT BOTS ---
+bot_data = [None] * (NUM_BOTS + 1)  # Index 1 to 5
+for i in range(1, NUM_BOTS + 1):
+    try:
+        api_id = int(os.environ.get(f"API_ID_{i}", 0))
+        api_hash = os.environ.get(f"API_HASH_{i}", "")
+        bot_token = os.environ.get(f"BOT_TOKEN_{i}", "")
+        
+        if api_id == 0 or not api_hash or not bot_token:
+            logger.info(f"Skipping Bot {i}: Missing config")
+            continue
+        
+        client = Client(
+            f"render_bot_{i}",
+            api_id=api_id,
+            api_hash=api_hash,
+            bot_token=bot_token,
+            sleep_threshold=3600  # Allow auto-sleep for floodwait up to 1 hour
+        )
+        clients.append(client)
+        bot_data[i] = {
+            'client': client,
+            'is_working': False,
+            'stop_event': asyncio.Event()
+        }
+        register_handlers(client, i)
+        logger.info(f"Bot {i} initialized successfully")
+    except ValueError as e:
+        logger.error(f"❌ Config Error for Bot {i}: {e}")
 
-# --- WEB SERVER (UNCHANGED) ---
+if not clients:
+    logger.error("No bots initialized. Exiting.")
+    sys.exit(1)
+
+# --- WEB SERVER ---
 async def web_handler(request):
-    return web.Response(text="Multi-Bot Running V9.1 (Multi-Bot Edition).")
+    return web.Response(text="Multi-Bot Running V9.3 (Bot Version).")
 
 async def start_web():
     app_web = web.Application()
@@ -454,13 +456,11 @@ async def start_web():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-# --- MAIN ---
 async def main():
     await start_web()
-    logger.info(f"🤖 Starting {len(BOTS)} bot(s)...")
-    tasks = [bot["client"].start() for bot in BOTS]
-    await asyncio.gather(*tasks)
-    logger.info("✅ All bots ready!")
+    logger.info("🤖 Starting Telegram Bots...")
+    for client in clients:
+        await client.start()
     await idle()
 
 if __name__ == "__main__":
