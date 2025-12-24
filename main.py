@@ -23,7 +23,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-logger.info("--- SYSTEM BOOT: V9.4 FIX PEER ID (MULTI-BOT VERSION) ---")
+logger.info("--- SYSTEM BOOT: V9.5 MULTI-DEST WITH PER-FILTER & PARALLEL COPY ---")
 
 # --- KONFIGURASI MULTI-BOT ---
 NUM_BOTS = 5
@@ -134,29 +134,46 @@ def parse_config(text: str) -> Dict:
     for key, pattern in patterns.items():
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            if key in ['speed']:
+            if key == 'dst':
+                # Ambil semua setelah 'tujuan:', split by space for multiple links
+                dst_links = match.group(1).strip().split()
+                config['dst_links'] = dst_links
+            elif key in ['speed']:
                 config[key] = float(match.group(1))
             elif key in ['batch_size', 'batch_time', 'ember']:
                 config[key] = int(match.group(1))
             else:
                 config[key] = match.group(1).strip().lower() if key == 'filter_type' else match.group(1).strip()
     
+    # Parse dynamic filter_tujuanN
+    filter_tujuan_matches = re.findall(r"filter_tujuan(\d+):\s*(\w+)", text, re.IGNORECASE)
+    config['filter_tujuan'] = {int(num): val.lower() for num, val in filter_tujuan_matches}
+    
     return config
 
 # --- 5. VALIDATE CONFIG ---
 def validate_config(config: Dict) -> Tuple[bool, str]:
-    required = ['src_start', 'src_end', 'dst']
+    required = ['src_start', 'src_end']
     for req in required:
         if req not in config:
             return False, f"Missing required field: {req}"
+    
+    if 'dst_links' not in config or not config['dst_links']:
+        return False, "Missing or empty 'tujuan:' field"
     
     try:
         config['delay_min'] = config.get('speed', DEFAULT_SPEED)
         if config['delay_min'] <= 0:
             return False, "Speed must be positive"
         
-        filter_str = config.get('filter_type', 'all')
-        config['filter_type'] = FilterType(filter_str)
+        default_filter_str = config.get('filter_type', 'all')
+        default_filter = FilterType(default_filter_str)
+        
+        # Validate filter_tujuan
+        config['dst_filters'] = []
+        for i in range(len(config['dst_links'])):
+            filter_str = config['filter_tujuan'].get(i+1, default_filter_str)
+            config['dst_filters'].append(FilterType(filter_str))
         
         config['batch_size'] = config.get('batch_size', DEFAULT_BATCH_SIZE)
         config['batch_time'] = config.get('batch_time', DEFAULT_BATCH_TIME)
@@ -165,8 +182,8 @@ def validate_config(config: Dict) -> Tuple[bool, str]:
         if config['batch_size'] <= 0 or config['batch_time'] < 0 or config['chunk_size'] <= 0:
             return False, "Batch/Ember values must be positive"
         
-    except ValueError:
-        return False, f"Invalid filter type: {filter_str}. Pilihan: all, video, foto, dokumen, audio, allout"
+    except ValueError as e:
+        return False, f"Invalid filter type: {e}. Pilihan: all, video, foto, dokumen, audio, allout"
     
     return True, ""
 
@@ -178,22 +195,25 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
     start_id: int = job['start_id']
     end_id: int = job['end_id']
     src_chat: any = job['src_chat']
-    dst_chat: any = job['dst_chat']
     
     batch_size: int = job['batch_size']
     batch_time: int = job['batch_time']
     delay_min: float = job['delay_min']
     chunk_size: int = job['chunk_size']
-    filter_type: FilterType = job['filter_type']
     
+    dst_list: List[Dict] = job['dst_list']  # [{'chat': , 'topic': , 'filter': FilterType, 'last_success_id': start_id-1, 'active': True, 'refresh_cooldown': 0}]
+    
+    num_dst = len(dst_list)
     delay_avg: float = delay_min + 0.25
     
-    stats = {'success': 0, 'failed': 0, 'total': end_id - start_id + 1}
+    # Stats aggregate and per dst
+    stats = {'success': 0, 'failed': 0, 'total': (end_id - start_id + 1) * num_dst}
+    per_dst_stats = {i: {'success': 0, 'failed': 0} for i in range(num_dst)}
+    
     processed_count = 0
     last_update_time = time.time()
     last_checkpoint_time = time.time()
     last_error_log = "-"
-    last_success_id = start_id - 1  # Initial, sebelum copy pertama
 
     try:
         for chunk_start in range(start_id, end_id + 1, chunk_size):
@@ -215,7 +235,10 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                     last_error_log = str(e)
                     bot_logger.warning(f"⚠️ Fetch chunk {chunk_start}-{chunk_end} failed (retry {retry+1}): {e}")
                     if retry == fetch_retries - 1:
-                        stats['failed'] += len(ids_to_fetch)
+                        for _ in ids_to_fetch:
+                            stats['failed'] += num_dst
+                            for i in range(num_dst):
+                                per_dst_stats[i]['failed'] += 1
                         continue
                     await asyncio.sleep(5)
 
@@ -234,64 +257,90 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
 
                 # Cek Validitas
                 if not msg or msg.empty or msg.service:
-                    stats['failed'] += 1
+                    stats['failed'] += num_dst
+                    for i in range(num_dst):
+                        per_dst_stats[i]['failed'] += 1
                     continue
 
-                # Filtering
-                should_copy = False
-                if filter_type == FilterType.VIDEO and msg.video: should_copy = True
-                elif filter_type == FilterType.FOTO and msg.photo: should_copy = True
-                elif filter_type == FilterType.DOKUMEN and msg.document: should_copy = True
-                elif filter_type == FilterType.AUDIO and (msg.audio or msg.voice): should_copy = True
-                elif filter_type == FilterType.ALL and not msg.sticker: should_copy = True
-                elif filter_type == FilterType.ALLOUT: should_copy = True
-                
-                if not should_copy:
-                    stats['failed'] += 1
-                    continue
+                # Parallel Copy Tasks
+                copy_tasks = []
+                for idx, dst in enumerate(dst_list):
+                    if not dst['active']:
+                        per_dst_stats[idx]['failed'] += 1
+                        continue
+                    
+                    # Filtering per dst
+                    should_copy = False
+                    filter_type = dst['filter']
+                    if filter_type == FilterType.VIDEO and msg.video: should_copy = True
+                    elif filter_type == FilterType.FOTO and msg.photo: should_copy = True
+                    elif filter_type == FilterType.DOKUMEN and msg.document: should_copy = True
+                    elif filter_type == FilterType.AUDIO and (msg.audio or msg.voice): should_copy = True
+                    elif filter_type == FilterType.ALL and not msg.sticker: should_copy = True
+                    elif filter_type == FilterType.ALLOUT: should_copy = True
+                    
+                    if not should_copy:
+                        per_dst_stats[idx]['failed'] += 1
+                        continue
 
-                # Copy Logic
-                max_retries = 10
-                msg_success = False
-                for retry_idx in range(max_retries):
-                    if bot_data[bot_id]['stop_event'].is_set():
-                        break
-                    try:
-                        copy_params = {'chat_id': dst_chat}
-                        if job['dst_topic']:
-                            copy_params['reply_to_message_id'] = job['dst_topic']
+                    # Create copy task
+                    async def copy_to_dst(dst_info, msg_id):
+                        max_retries = 10
+                        for retry_idx in range(max_retries):
+                            try:
+                                copy_params = {'chat_id': dst_info['chat']}
+                                if dst_info['topic']:
+                                    copy_params['reply_to_message_id'] = dst_info['topic']
 
-                        await msg.copy(**copy_params)
+                                await msg.copy(**copy_params)
+                                
+                                per_dst_stats[idx]['success'] += 1
+                                dst_info['last_success_id'] = msg_id
+                                
+                                return True
+                            except FloodWait as e:
+                                bot_logger.info(f"FloodWait for dst {idx}: Sleeping for {e.value} seconds")
+                                await asyncio.sleep(e.value + 10)
+                            except (PeerIdInvalid, ChannelInvalid, ChannelPrivate) as e:
+                                last_error_log = f"Peer Invalid for dst {idx}: {str(e)}"
+                                bot_logger.error(last_error_log)
+                                # Anti-Amnesia: Refresh if cooldown allows
+                                if time.time() - dst_info['refresh_cooldown'] > 300:  # 5 min cooldown
+                                    try:
+                                        await app.get_chat(dst_info['chat'])
+                                        dst_info['refresh_cooldown'] = time.time()
+                                        bot_logger.info(f"Refreshed peer for dst {idx}")
+                                    except Exception as refresh_e:
+                                        bot_logger.error(f"Refresh failed for dst {idx}: {refresh_e}")
+                                        dst_info['active'] = False  # Deactivate this dst
+                                        return False
+                            except RPCError as e:
+                                last_error_log = f"RPCError for dst {idx}: {str(e)}"
+                                if "500" in str(e) or "INTERDC" in str(e):
+                                    await asyncio.sleep(10)
+                                else:
+                                    await asyncio.sleep(5)
+                            except Exception as e:
+                                last_error_log = f"Error for dst {idx}: {str(e)}"
+                                await asyncio.sleep(5)
                         
-                        stats['success'] += 1
-                        processed_count += 1
-                        msg_success = True
-                        last_success_id = msg.id  # Update last success ID
-                        
-                        await asyncio.sleep(random.uniform(delay_min, delay_min + 0.5))
-                        break
+                        per_dst_stats[idx]['failed'] += 1
+                        return False
 
-                    except FloodWait as e:
-                        bot_logger.info(f"FloodWait: Sleeping for {e.value} seconds")
-                        await status_msg.edit(f"🌊 **Kena Limit Telegram!**\nTunggu {e.value} detik...")
-                        await asyncio.sleep(e.value + 10)
-                    except (PeerIdInvalid, ChannelInvalid, ChannelPrivate):
-                        # Fatal error for this message, but try to continue
-                        bot_logger.error(f"Peer Invalid saat copy: {dst_chat}")
-                        last_error_log = "Peer ID Invalid (Bot belum join/admin?)"
-                        break 
-                    except RPCError as e:
-                        last_error_log = str(e)
-                        if "500" in str(e) or "INTERDC" in str(e):
-                            await asyncio.sleep(10)
+                    copy_tasks.append(copy_to_dst(dst, msg.id))
+
+                # Run parallel if multiple dst
+                if copy_tasks:
+                    results = await asyncio.gather(*copy_tasks, return_exceptions=True)
+                    for res in results:
+                        if isinstance(res, Exception):
+                            bot_logger.warning(f"Parallel copy exception: {res}")
+                        elif res:
+                            stats['success'] += 1
                         else:
-                            await asyncio.sleep(5)
-                    except Exception as e:
-                        last_error_log = str(e)
-                        await asyncio.sleep(5)
-
-                if not msg_success:
-                    stats['failed'] += 1
+                            stats['failed'] += 1
+                    processed_count += len(copy_tasks)
+                    await asyncio.sleep(random.uniform(delay_min, delay_min + 0.5))
 
                 # Update Status (Pesan 1 - Dashboard, tiap 10s)
                 if time.time() - last_update_time > 10:
@@ -304,11 +353,12 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                     bar_str = make_bar(current_proc, stats['total'])
                     cpu_val, cpu_txt, ram_val, speed_txt = get_system_status(delay_avg)
                     
+                    active_dst = sum(1 for d in dst_list if d['active'])
                     text = (
-                        f"🐎 **WORKHORSE V9.4: FIX PEER ID (BOT {bot_id})**\n"
+                        f"🐎 **WORKHORSE V10 Gen1 (BOT {bot_id})**\n"
                         f"{bar_str}\n\n"
                         f"📊 **Stats:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal `{stats['failed']}` | Sisa `{remaining_files}`\n"
-                        f"🏁 **ETA:** ± {eta_text} | Filter: `{filter_type.value.upper()}`\n\n"
+                        f"🏁 **ETA:** ± {eta_text} | Tujuan Aktif: `{active_dst}/{num_dst}`\n\n"
                         f"🌡️ **Resources:** CPU {cpu_val}% [{cpu_txt}] | RAM {ram_val:.2f} MB\n\n"
                         f"⚡ **Config:** Ember {chunk_size} | Jeda {delay_avg:.2f}s | {speed_txt}\n"
                         f"Batch: {batch_time}s tiap {batch_size} file\n\n"
@@ -323,10 +373,11 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                 # Update Checkpoint (Pesan 2, tiap 60s)
                 if time.time() - last_checkpoint_time > 60:
                     saved_time = time.strftime("%H:%M:%S")
-                    checkpoint_text = (
-                        f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
-                        f"📌 Last ID: {last_success_id} 🕒 Saved: {saved_time}"
-                    )
+                    checkpoint_text = f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
+                    for idx, dst in enumerate(dst_list):
+                        status = "Aktif" if dst['active'] else "Non-Aktif (Error)"
+                        checkpoint_text += f"📌 Tujuan {idx+1} ({dst['chat']}): Last ID {dst['last_success_id']} | {status}\n"
+                    checkpoint_text += f"🕒 Saved: {saved_time}"
                     try:
                         await checkpoint_msg.edit(checkpoint_text)
                         last_checkpoint_time = time.time()
@@ -345,10 +396,11 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
         
         # Update Checkpoint akhir
         saved_time = time.strftime("%H:%M:%S")
-        checkpoint_text = (
-            f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
-            f"📌 Last ID: {last_success_id} 🕒 Saved: {saved_time}"
-        )
+        checkpoint_text = f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
+        for idx, dst in enumerate(dst_list):
+            status = "Aktif" if dst['active'] else "Non-Aktif (Error)"
+            checkpoint_text += f"📌 Tujuan {idx+1} ({dst['chat']}): Last ID {dst['last_success_id']} | {status}\n"
+        checkpoint_text += f"🕒 Saved: {saved_time}"
         await checkpoint_msg.edit(checkpoint_text)
 
     except Exception as e:
@@ -385,15 +437,28 @@ def register_handlers(app: Client, bot_id: int):
 
             src_chat, start_id = parse_link(config['src_start'])
             _, end_id = parse_link(config['src_end'])
-            dst_chat, dst_topic = parse_link(config['dst'])
 
-            if not src_chat or not dst_chat or not start_id or not end_id:
-                return await message.reply("❌ **Link Salah Format!** Pastikan link valid (contoh: `https://t.me/c/1234/10`).")
+            if not src_chat or not start_id or not end_id:
+                return await message.reply("❌ **Link Sumber Salah Format!** Pastikan link valid.")
+
+            # Parse multiple dst
+            dst_list = []
+            for link in config['dst_links']:
+                dst_chat, dst_topic = parse_link(link)
+                if not dst_chat:
+                    return await message.reply(f"❌ **Link Tujuan Salah: {link}**")
+                dst_list.append({
+                    'chat': dst_chat,
+                    'topic': dst_topic,
+                    'filter': config['dst_filters'][len(dst_list) - 1],  # Assign per filter
+                    'last_success_id': start_id - 1,
+                    'active': True,
+                    'refresh_cooldown': 0
+                })
 
             status_msg = await message.reply(f"🔍 **Verifikasi Akses Channel (Bot {bot_id})...**")
 
             # --- FIX PEER ID INVALID ---
-            # Kita coba 'get_chat' dulu agar bot menyimpan akses hash
             try:
                 # Cek Sumber
                 try:
@@ -402,41 +467,43 @@ def register_handlers(app: Client, bot_id: int):
                 except Exception as e:
                     return await status_msg.edit(f"❌ **Gagal Akses SUMBER:**\nBot belum join ke channel/grup sumber atau ID salah.\n\nError: `{e}`")
 
-                # Cek Tujuan
-                try:
-                    chat_dst = await client.get_chat(dst_chat)
-                    bot_logger.info(f"Dest verified: {chat_dst.title}")
-                except Exception as e:
-                    return await status_msg.edit(f"❌ **Gagal Akses TUJUAN:**\nBot belum admin di channel/grup tujuan.\n\nError: `{e}`")
+                # Cek Tujuan (multiple)
+                for idx, dst in enumerate(dst_list):
+                    try:
+                        chat_dst = await client.get_chat(dst['chat'])
+                        bot_logger.info(f"Dest {idx+1} verified: {chat_dst.title}")
+                    except Exception as e:
+                        dst['active'] = False
+                        bot_logger.warning(f"Dest {idx+1} verification failed: {e}")
 
             except Exception as e:
                 return await status_msg.edit(f"❌ **Verifikasi Gagal:** {e}")
 
-            # Jika lolos verifikasi, lanjut
-            await status_msg.edit(f"🐎 **Bot {bot_id} Memulai Proses Copy...**")
+             # Jika lolos verifikasi, lanjut
+            await status_msg.edit(f"🐎 **Bot {bot_id} Memulai Proses Copy ke {len(dst_list)} Tujuan...**")
 
             # Buat pesan checkpoint awal
             initial_saved_time = time.strftime("%H:%M:%S")
-            checkpoint_msg = await message.reply(
-                f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
-                f"📌 Last ID: {start_id - 1} 🕒 Saved: {initial_saved_time}"
-            )
+            checkpoint_text = f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
+            for idx, dst in enumerate(dst_list):
+                status = "Aktif" if dst['active'] else "Non-Aktif (Error)"
+                checkpoint_text += f"📌 Tujuan {idx+1} ({dst['chat']}): Last ID {dst['last_success_id']} | {status}\n"
+            checkpoint_text += f"🕒 Saved: {initial_saved_time}"
+            checkpoint_msg = await message.reply(checkpoint_text)
 
             job = {
                 'src_chat': src_chat, 
                 'start_id': start_id, 
                 'end_id': end_id,
-                'dst_chat': dst_chat, 
-                'dst_topic': dst_topic,
+                'dst_list': dst_list,
                 'delay_min': config['delay_min'],
-                'filter_type': config['filter_type'],
                 'batch_size': config['batch_size'],
                 'batch_time': config['batch_time'],
                 'chunk_size': config['chunk_size']
             }
             
             asyncio.create_task(copy_worker(job, status_msg, checkpoint_msg, bot_id, client, bot_logger))
-            
+          
         except Exception as e:
             bot_logger.error(f"❌ Error in start_cmd: {e}")
             await message.reply(f"❌ **Error Config:** {e}")
@@ -454,7 +521,7 @@ def register_handlers(app: Client, bot_id: int):
         cpu_val, cpu_txt, ram_val, _ = get_system_status(0)
         status_bot = "🔥 Aktif" if bot_data[bot_id]['is_working'] else "💤 Istirahat"
         text = (
-            f"🐴 **Status Server V9.4 (BOT {bot_id})**\n"
+            f"🐴 **Status Server V10 Gen1 (BOT {bot_id})**\n"
             f"──────────────────\n"
             f"🤖 **Status:** {status_bot}\n"
             f"🧠 **CPU:** {cpu_val}% [{cpu_txt}]\n"
@@ -506,7 +573,7 @@ if not clients:
 
 # --- WEB SERVER ---
 async def web_handler(request):
-    return web.Response(text="Multi-Bot Running V9.4 (Fix PeerID).")
+    return web.Response(text="Multi-Bot Running V9.5 (Multi-Dest).")
 
 async def start_web():
     app_web = web.Application()
