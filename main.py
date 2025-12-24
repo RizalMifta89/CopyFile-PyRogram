@@ -10,7 +10,7 @@ import psutil
 from enum import Enum
 from typing import List, Tuple, Optional, Dict
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, RPCError, PeerIdInvalid, ChannelInvalid, ChannelPrivate
 from aiohttp import web
 
 # --- LOGGING SYSTEM ---
@@ -23,12 +23,12 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-logger.info("--- SYSTEM BOOT: V9.3 OPTIMIZED SMART CHUNKING EDITION (MULTI-BOT TOKEN VERSION) ---")
+logger.info("--- SYSTEM BOOT: V9.4 FIX PEER ID (MULTI-BOT VERSION) ---")
 
 # --- KONFIGURASI MULTI-BOT ---
 NUM_BOTS = 5
 clients = []
-bot_data = []  # List of dicts for each bot: {'client': Client, 'is_working': False, 'stop_event': asyncio.Event(), 'logger': logger}
+bot_data = []  # List of dicts for each bot
 
 try:
     PORT = int(os.environ.get("PORT", 8080))
@@ -104,9 +104,14 @@ def make_bar(current: int, total: int, length: int = 10) -> str:
 def parse_link(link: Optional[str]) -> Tuple[Optional[any], Optional[int]]:
     if not link:
         return None, None
+    # Match private link: https://t.me/c/1234567890/100 -> ID: -1001234567890
     private_match = re.search(r"t\.me/c/(\d+)/(\d+)", link)
     if private_match:
-        return int("-100" + private_match.group(1)), int(private_match.group(2))
+        chat_id_str = private_match.group(1)
+        msg_id = int(private_match.group(2))
+        return int("-100" + chat_id_str), msg_id
+        
+    # Match public link: https://t.me/username/100
     public_match = re.search(r"t\.me/([^/]+)/(\d+)", link)
     if public_match:
         return public_match.group(1), int(public_match.group(2))
@@ -202,9 +207,11 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                 try:
                     messages_batch = await app.get_messages(src_chat, ids_to_fetch)
                     break
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 5)
                 except Exception as e:
                     last_error_log = str(e)
-                    bot_logger.warning(f"⚠️ Fetch chunk {chunk_start}-{chunk_end} failed (retry {retry+1}/{fetch_retries}): {e}")
+                    bot_logger.warning(f"⚠️ Fetch chunk {chunk_start}-{chunk_end} failed (retry {retry+1}): {e}")
                     if retry == fetch_retries - 1:
                         stats['failed'] += len(ids_to_fetch)
                         continue
@@ -217,33 +224,31 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                 if bot_data[bot_id]['stop_event'].is_set():
                     break
                 
+                # BATCH SLEEP
                 if processed_count > 0 and processed_count % batch_size == 0:
                     await status_msg.edit(f"😴 **SEDANG ISTIRAHAT BATCH ({batch_time}s)...**\n\n❄️ Mendinginkan Mesin...")
                     await asyncio.sleep(batch_time)
                     last_update_time = time.time()
 
+                # Cek Validitas
                 if not msg or msg.empty or msg.service:
                     stats['failed'] += 1
                     continue
 
+                # Filtering
                 should_copy = False
-                if filter_type == FilterType.VIDEO and msg.video:
-                    should_copy = True
-                elif filter_type == FilterType.FOTO and msg.photo:
-                    should_copy = True
-                elif filter_type == FilterType.DOKUMEN and msg.document:
-                    should_copy = True
-                elif filter_type == FilterType.AUDIO and (msg.audio or msg.voice):
-                    should_copy = True
-                elif filter_type == FilterType.ALL and not msg.sticker:
-                    should_copy = True
-                elif filter_type == FilterType.ALLOUT:
-                    should_copy = True
+                if filter_type == FilterType.VIDEO and msg.video: should_copy = True
+                elif filter_type == FilterType.FOTO and msg.photo: should_copy = True
+                elif filter_type == FilterType.DOKUMEN and msg.document: should_copy = True
+                elif filter_type == FilterType.AUDIO and (msg.audio or msg.voice): should_copy = True
+                elif filter_type == FilterType.ALL and not msg.sticker: should_copy = True
+                elif filter_type == FilterType.ALLOUT: should_copy = True
                 
                 if not should_copy:
                     stats['failed'] += 1
                     continue
 
+                # Copy Logic
                 max_retries = 10
                 msg_success = False
                 for retry_idx in range(max_retries):
@@ -267,22 +272,25 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                         bot_logger.info(f"FloodWait: Sleeping for {e.value} seconds")
                         await status_msg.edit(f"🌊 **Kena Limit Telegram!**\nTunggu {e.value} detik...")
                         await asyncio.sleep(e.value + 10)
-                    
+                    except (PeerIdInvalid, ChannelInvalid, ChannelPrivate):
+                        # Fatal error for this message, but try to continue
+                        bot_logger.error(f"Peer Invalid saat copy: {dst_chat}")
+                        last_error_log = "Peer ID Invalid (Bot belum join/admin?)"
+                        break 
                     except RPCError as e:
                         last_error_log = str(e)
-                        bot_logger.warning(f"RPCError in copy: {e}")
                         if "500" in str(e) or "INTERDC" in str(e):
                             await asyncio.sleep(10)
                         else:
                             await asyncio.sleep(5)
                     except Exception as e:
                         last_error_log = str(e)
-                        bot_logger.error(f"Unexpected error in copy: {e}")
                         await asyncio.sleep(5)
 
                 if not msg_success:
                     stats['failed'] += 1
 
+                # Update Status
                 if time.time() - last_update_time > 10:
                     current_proc = stats['success'] + stats['failed']
                     remaining_files = stats['total'] - current_proc
@@ -294,7 +302,7 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                     cpu_val, cpu_txt, ram_val, speed_txt = get_system_status(delay_avg)
                     
                     text = (
-                        f"🐎 **WORKHORSE V9.3: OPTIMIZED SMART CHUNKING (BOT {bot_id})**\n"
+                        f"🐎 **WORKHORSE V9.4: FIX PEER ID (BOT {bot_id})**\n"
                         f"{bar_str}\n\n"
                         f"📊 **Stats:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal `{stats['failed']}` | Sisa `{remaining_files}`\n"
                         f"🏁 **ETA:** ± {eta_text} | Filter: `{filter_type.value.upper()}`\n\n"
@@ -306,8 +314,8 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                     try:
                         await status_msg.edit(text)
                         last_update_time = time.time()
-                    except Exception as e:
-                        bot_logger.warning(f"Failed to update status: {e}")
+                    except:
+                        pass
             
             del messages_batch
             gc.collect()
@@ -325,16 +333,12 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
     finally:
         bot_data[bot_id]['is_working'] = False
 
-# --- COMMANDS (PERBAIKI UNTUK LEBIH ROBUST & DINAMIS) ---
+# --- COMMANDS (DINAMIS & ROBUST) ---
 def register_handlers(app: Client, bot_id: int):
     bot_logger = logging.getLogger(f"{__name__}.bot{bot_id}")
     bot_logger.handlers = logger.handlers
     bot_logger.setLevel(logger.level)
 
-    # === LOGIKA NAMA PERINTAH DINAMIS ===
-    # Bot 1: Handle polosan (start, stop, stats) DAN yang bernomor (start1, stop1, stats1)
-    # Bot Lain: Hanya handle yang bernomor (start2, stop2, stats2, dst)
-    
     if bot_id == 1:
         start_commands = ["start", "start1"]
         stop_commands = ["stop", "stop1"]
@@ -344,7 +348,6 @@ def register_handlers(app: Client, bot_id: int):
         stop_commands = [f"stop{bot_id}"]
         stats_commands = [f"stats{bot_id}"]
 
-    # --- HANDLER START ---
     @app.on_message(filters.command(start_commands) & filters.group)
     async def start_cmd(client, message):
         if bot_data[bot_id]['is_working']:
@@ -361,9 +364,32 @@ def register_handlers(app: Client, bot_id: int):
             dst_chat, dst_topic = parse_link(config['dst'])
 
             if not src_chat or not dst_chat or not start_id or not end_id:
-                return await message.reply("❌ **Link Salah Format!** Pastikan link seperti https://t.me/c/1234/100.")
+                return await message.reply("❌ **Link Salah Format!** Pastikan link valid (contoh: `https://t.me/c/1234/10`).")
 
-            status_msg = await message.reply(f"🐎 **Bot {bot_id} Menyiapkan Proses Copy...**")
+            status_msg = await message.reply(f"🔍 **Verifikasi Akses Channel (Bot {bot_id})...**")
+
+            # --- FIX PEER ID INVALID ---
+            # Kita coba 'get_chat' dulu agar bot menyimpan akses hash
+            try:
+                # Cek Sumber
+                try:
+                    chat_src = await client.get_chat(src_chat)
+                    bot_logger.info(f"Source verified: {chat_src.title}")
+                except Exception as e:
+                    return await status_msg.edit(f"❌ **Gagal Akses SUMBER:**\nBot belum join ke channel/grup sumber atau ID salah.\n\nError: `{e}`")
+
+                # Cek Tujuan
+                try:
+                    chat_dst = await client.get_chat(dst_chat)
+                    bot_logger.info(f"Dest verified: {chat_dst.title}")
+                except Exception as e:
+                    return await status_msg.edit(f"❌ **Gagal Akses TUJUAN:**\nBot belum admin di channel/grup tujuan.\n\nError: `{e}`")
+
+            except Exception as e:
+                return await status_msg.edit(f"❌ **Verifikasi Gagal:** {e}")
+
+            # Jika lolos verifikasi, lanjut
+            await status_msg.edit(f"🐎 **Bot {bot_id} Memulai Proses Copy...**")
 
             job = {
                 'src_chat': src_chat, 
@@ -382,9 +408,8 @@ def register_handlers(app: Client, bot_id: int):
             
         except Exception as e:
             bot_logger.error(f"❌ Error in start_cmd: {e}")
-            await message.reply(f"❌ **Error Config:** {e}\nCoba cek env vars atau akses bot.")
+            await message.reply(f"❌ **Error Config:** {e}")
 
-    # --- HANDLER STOP (DINAMIS) ---
     @app.on_message(filters.command(stop_commands) & filters.group)
     async def stop_cmd(client, message):
         if bot_data[bot_id]['is_working']:
@@ -393,13 +418,12 @@ def register_handlers(app: Client, bot_id: int):
         else:
             await message.reply(f"💤 **Bot {bot_id} Tidak Ada Proses Berjalan.**")
 
-    # --- HANDLER STATS (DINAMIS) ---
     @app.on_message(filters.command(stats_commands) & filters.group)
     async def stats_cmd(client, message):
         cpu_val, cpu_txt, ram_val, _ = get_system_status(0)
         status_bot = "🔥 Aktif" if bot_data[bot_id]['is_working'] else "💤 Istirahat"
         text = (
-            f"🐴 **Status Server V9.3 (BOT {bot_id})**\n"
+            f"🐴 **Status Server V9.4 (BOT {bot_id})**\n"
             f"──────────────────\n"
             f"🤖 **Status:** {status_bot}\n"
             f"🧠 **CPU:** {cpu_val}% [{cpu_txt}]\n"
@@ -451,7 +475,7 @@ if not clients:
 
 # --- WEB SERVER ---
 async def web_handler(request):
-    return web.Response(text="Multi-Bot Running V9.3 (Bot Version).")
+    return web.Response(text="Multi-Bot Running V9.4 (Fix PeerID).")
 
 async def start_web():
     app_web = web.Application()
