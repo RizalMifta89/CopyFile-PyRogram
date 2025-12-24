@@ -24,7 +24,8 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-logger.info("--- SYSTEM BOOT: V9.9 STABLE (BASE V9.4 + DUAL MSG + ANTI-PIKUN) ---")
+# Gunakan print agar langsung muncul di log Render tanpa delay buffering
+print("--- SYSTEM BOOT: V9.9 DIAGNOSTIC (BASE V9.4 + DUAL MSG + ANTI-PIKUN) ---", flush=True)
 
 # --- KONFIGURASI MULTI-BOT ---
 NUM_BOTS = 5
@@ -34,7 +35,7 @@ bot_data = []  # List of dicts for each bot
 try:
     PORT = int(os.environ.get("PORT", 8080))
 except ValueError as e:
-    logger.error(f"❌ Config Error: {e}")
+    print(f"❌ Config Error PORT: {e}", flush=True)
     sys.exit(1)
 
 DEFAULT_BATCH_SIZE = 10000
@@ -493,6 +494,4 @@ def register_handlers(app: Client, bot_id: int):
         else:
             await message.reply(f"💤 **Bot {bot_id} Tidak Ada Proses Berjalan.**")
 
-    @app.on_message(filters.command(stats_commands) & filters.group)
-    async def stats_cmd(client, message):
-        cp
+    @app.on_message(filters.
