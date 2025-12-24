@@ -36,9 +36,9 @@ except ValueError as e:
     logger.error(f"❌ Config Error: {e}")
     sys.exit(1)
 
-DEFAULT_BATCH_SIZE = 10000  # Nilai tinggi untuk efisiensi pada bot API
+DEFAULT_BATCH_SIZE = 10000
 DEFAULT_BATCH_TIME = 60
-DEFAULT_CHUNK_SIZE = 50  # Tingkatkan default untuk fetch lebih efisien
+DEFAULT_CHUNK_SIZE = 50
 DEFAULT_SPEED = 0.1
 
 class FilterType(Enum):
@@ -47,7 +47,7 @@ class FilterType(Enum):
     FOTO = 'foto'
     DOKUMEN = 'dokumen'
     AUDIO = 'audio'
-    ALLOUT = 'allout'  # Baru: tanpa filter apapun
+    ALLOUT = 'allout'
 
 # --- 1. HELPER: FORMAT WAKTU (ETA) ---
 def format_time(seconds: float) -> str:
@@ -101,7 +101,7 @@ def make_bar(current: int, total: int, length: int = 10) -> str:
     return f"{bar} **{int(pct * 100)}%**"
 
 # --- 3. PARSE LINK ---
-def parse_link(link: Optional[str]) -> Tuple[Optional[any], Optional[int]]:  # src_chat bisa str atau int
+def parse_link(link: Optional[str]) -> Tuple[Optional[any], Optional[int]]:
     if not link:
         return None, None
     private_match = re.search(r"t\.me/c/(\d+)/(\d+)", link)
@@ -112,7 +112,7 @@ def parse_link(link: Optional[str]) -> Tuple[Optional[any], Optional[int]]:  # s
         return public_match.group(1), int(public_match.group(2))
     return None, None
 
-# --- 4. PARSE CONFIG FROM COMMAND (OPTIMIZED WITH REGEX, TAMBAH BATCH & EMBER) ---
+# --- 4. PARSE CONFIG FROM COMMAND ---
 def parse_config(text: str) -> Dict:
     config = {}
     patterns = {
@@ -121,9 +121,9 @@ def parse_config(text: str) -> Dict:
         'dst': r"tujuan:\s*(.+)",
         'speed': r"speed:\s*(\d+\.?\d*)",
         'filter_type': r"filter:\s*(\w+)",
-        'batch_size': r"batch_size:\s*(\d+)",  # Baru: untuk set batch size
-        'batch_time': r"batch_time:\s*(\d+)",  # Baru: untuk set batch time
-        'ember': r"ember:\s*(\d+)"  # Baru: untuk set chunk_size (ember)
+        'batch_size': r"batch_size:\s*(\d+)",
+        'batch_time': r"batch_time:\s*(\d+)",
+        'ember': r"ember:\s*(\d+)"
     }
     
     for key, pattern in patterns.items():
@@ -172,7 +172,7 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
     
     start_id: int = job['start_id']
     end_id: int = job['end_id']
-    src_chat: any = job['src_chat']  # Bisa str atau int
+    src_chat: any = job['src_chat']
     dst_chat: any = job['dst_chat']
     
     batch_size: int = job['batch_size']
@@ -184,7 +184,7 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
     delay_avg: float = delay_min + 0.25
     
     stats = {'success': 0, 'failed': 0, 'total': end_id - start_id + 1}
-    processed_count = 0  # Success count for batch sleep
+    processed_count = 0
     last_update_time = time.time()
     last_error_log = "-"
 
@@ -197,7 +197,7 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
             ids_to_fetch = list(range(chunk_start, chunk_end + 1))
             
             messages_batch = []
-            fetch_retries = 5  # Tingkatkan retry untuk stabilitas
+            fetch_retries = 5
             for retry in range(fetch_retries):
                 try:
                     messages_batch = await app.get_messages(src_chat, ids_to_fetch)
@@ -208,7 +208,7 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                     if retry == fetch_retries - 1:
                         stats['failed'] += len(ids_to_fetch)
                         continue
-                    await asyncio.sleep(5)  # Backoff lebih panjang
+                    await asyncio.sleep(5)
 
             if not messages_batch:
                 continue
@@ -217,18 +217,15 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                 if bot_data[bot_id]['stop_event'].is_set():
                     break
                 
-                # --- LOGIKA BATCH SLEEP (ISTIRAHAT PANJANG) ---
                 if processed_count > 0 and processed_count % batch_size == 0:
                     await status_msg.edit(f"😴 **SEDANG ISTIRAHAT BATCH ({batch_time}s)...**\n\n❄️ Mendinginkan Mesin...")
                     await asyncio.sleep(batch_time)
                     last_update_time = time.time()
 
-                # Cek Validitas Pesan
                 if not msg or msg.empty or msg.service:
                     stats['failed'] += 1
                     continue
 
-                # --- FILTERING ---
                 should_copy = False
                 if filter_type == FilterType.VIDEO and msg.video:
                     should_copy = True
@@ -247,8 +244,7 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                     stats['failed'] += 1
                     continue
 
-                # --- EKSEKUSI COPY (DENGAN RETRY LOOP) ---
-                max_retries = 10  # Tingkatkan retry untuk hindari macet
+                max_retries = 10
                 msg_success = False
                 for retry_idx in range(max_retries):
                     if bot_data[bot_id]['stop_event'].is_set():
@@ -264,15 +260,13 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                         processed_count += 1
                         msg_success = True
                         
-                        # Jeda aman per pesan (float)
                         await asyncio.sleep(random.uniform(delay_min, delay_min + 0.5))
                         break
 
                     except FloodWait as e:
                         bot_logger.info(f"FloodWait: Sleeping for {e.value} seconds")
                         await status_msg.edit(f"🌊 **Kena Limit Telegram!**\nTunggu {e.value} detik...")
-                        await asyncio.sleep(e.value + 10)  # Tambah buffer
-                        # Continue tanpa increment retry_idx
+                        await asyncio.sleep(e.value + 10)
                     
                     except RPCError as e:
                         last_error_log = str(e)
@@ -289,7 +283,6 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                 if not msg_success:
                     stats['failed'] += 1
 
-                # --- UPDATE TAMPILAN STATUS (PERBAIKI UNTUK LEBIH RINGKAS) ---
                 if time.time() - last_update_time > 10:
                     current_proc = stats['success'] + stats['failed']
                     remaining_files = stats['total'] - current_proc
@@ -301,7 +294,7 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                     cpu_val, cpu_txt, ram_val, speed_txt = get_system_status(delay_avg)
                     
                     text = (
-                        f"🐎 **WORKHORSE V9.3: OPTIMIZED SMART CHUNKING (BOT VERSION)**\n"
+                        f"🐎 **WORKHORSE V9.3: OPTIMIZED SMART CHUNKING (BOT {bot_id})**\n"
                         f"{bar_str}\n\n"
                         f"📊 **Stats:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal `{stats['failed']}` | Sisa `{remaining_files}`\n"
                         f"🏁 **ETA:** ± {eta_text} | Filter: `{filter_type.value.upper()}`\n\n"
@@ -316,15 +309,13 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
                     except Exception as e:
                         bot_logger.warning(f"Failed to update status: {e}")
             
-            # Bersihkan memori setiap chunk selesai
             del messages_batch
             gc.collect()
 
-        # --- LAPORAN AKHIR ---
         final_msg = "✅ **SELESAI!**" if not bot_data[bot_id]['stop_event'].is_set() else "🛑 **DIBATALKAN!**"
         await status_msg.edit(
             f"{final_msg}\n\n"
-            f"📊 **Laporan Akhir:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal/Skip `{stats['failed']}`\n"
+            f"📊 **Laporan Akhir (BOT {bot_id}):** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal/Skip `{stats['failed']}`\n"
             f"📝 **Last Error:** {last_error_log}"
         )
 
@@ -334,12 +325,16 @@ async def copy_worker(job: Dict, status_msg, bot_id: int, app: Client, bot_logge
     finally:
         bot_data[bot_id]['is_working'] = False
 
-# --- COMMANDS (PERBAIKI UNTUK LEBIH ROBUST) ---
+# --- COMMANDS (PERBAIKI UNTUK LEBIH ROBUST & DINAMIS) ---
 def register_handlers(app: Client, bot_id: int):
     bot_logger = logging.getLogger(f"{__name__}.bot{bot_id}")
-    bot_logger.handlers = logger.handlers  # Share handlers
+    bot_logger.handlers = logger.handlers
     bot_logger.setLevel(logger.level)
 
+    # === LOGIKA NAMA PERINTAH DINAMIS ===
+    # Bot 1: Handle polosan (start, stop, stats) DAN yang bernomor (start1, stop1, stats1)
+    # Bot Lain: Hanya handle yang bernomor (start2, stop2, stats2, dst)
+    
     if bot_id == 1:
         start_commands = ["start", "start1"]
         stop_commands = ["stop", "stop1"]
@@ -349,10 +344,11 @@ def register_handlers(app: Client, bot_id: int):
         stop_commands = [f"stop{bot_id}"]
         stats_commands = [f"stats{bot_id}"]
 
+    # --- HANDLER START ---
     @app.on_message(filters.command(start_commands) & filters.group)
     async def start_cmd(client, message):
         if bot_data[bot_id]['is_working']:
-            return await message.reply("⚠️ **Sedang Sibuk!** Gunakan `/stop` dulu.")
+            return await message.reply(f"⚠️ **Bot {bot_id} Sedang Sibuk!** Gunakan `/{stop_commands[-1]}` dulu.")
         
         try:
             config = parse_config(message.text)
@@ -367,7 +363,7 @@ def register_handlers(app: Client, bot_id: int):
             if not src_chat or not dst_chat or not start_id or not end_id:
                 return await message.reply("❌ **Link Salah Format!** Pastikan link seperti https://t.me/c/1234/100.")
 
-            status_msg = await message.reply("🐎 **Menyiapkan Proses Copy...**")
+            status_msg = await message.reply(f"🐎 **Bot {bot_id} Menyiapkan Proses Copy...**")
 
             job = {
                 'src_chat': src_chat, 
@@ -388,20 +384,22 @@ def register_handlers(app: Client, bot_id: int):
             bot_logger.error(f"❌ Error in start_cmd: {e}")
             await message.reply(f"❌ **Error Config:** {e}\nCoba cek env vars atau akses bot.")
 
+    # --- HANDLER STOP (DINAMIS) ---
     @app.on_message(filters.command(stop_commands) & filters.group)
     async def stop_cmd(client, message):
         if bot_data[bot_id]['is_working']:
             bot_data[bot_id]['stop_event'].set()
-            await message.reply("🛑 **Proses Dihentikan!** Menunggu selesai...")
+            await message.reply(f"🛑 **Proses Bot {bot_id} Dihentikan!** Menunggu selesai...")
         else:
-            await message.reply("💤 **Tidak Ada Proses Berjalan.**")
+            await message.reply(f"💤 **Bot {bot_id} Tidak Ada Proses Berjalan.**")
 
+    # --- HANDLER STATS (DINAMIS) ---
     @app.on_message(filters.command(stats_commands) & filters.group)
     async def stats_cmd(client, message):
         cpu_val, cpu_txt, ram_val, _ = get_system_status(0)
         status_bot = "🔥 Aktif" if bot_data[bot_id]['is_working'] else "💤 Istirahat"
         text = (
-            f"🐴 **Status Server V9.3 (BOT {bot_id} VERSION)**\n"
+            f"🐴 **Status Server V9.3 (BOT {bot_id})**\n"
             f"──────────────────\n"
             f"🤖 **Status:** {status_bot}\n"
             f"🧠 **CPU:** {cpu_val}% [{cpu_txt}]\n"
@@ -413,12 +411,12 @@ def register_handlers(app: Client, bot_id: int):
     @app.on_message(filters.command("ping") & filters.group)
     async def ping_cmd(client, message):
         start = time.time()
-        msg = await message.reply("🏓 **Pong!**")
+        msg = await message.reply(f"🏓 **Pong Bot {bot_id}!**")
         end = time.time()
-        await msg.edit(f"🏓 **Pong!** Latency: `{(end - start) * 1000:.2f}ms`")
+        await msg.edit(f"🏓 **Pong Bot {bot_id}!** Latency: `{(end - start) * 1000:.2f}ms`")
 
 # --- INIT BOTS ---
-bot_data = [None] * (NUM_BOTS + 1)  # Index 1 to 5
+bot_data = [None] * (NUM_BOTS + 1)
 for i in range(1, NUM_BOTS + 1):
     try:
         api_id = int(os.environ.get(f"API_ID_{i}", 0))
@@ -434,7 +432,7 @@ for i in range(1, NUM_BOTS + 1):
             api_id=api_id,
             api_hash=api_hash,
             bot_token=bot_token,
-            sleep_threshold=3600  # Allow auto-sleep for floodwait up to 1 hour
+            sleep_threshold=3600
         )
         clients.append(client)
         bot_data[i] = {
