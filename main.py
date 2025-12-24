@@ -7,11 +7,10 @@ import sys
 import gc
 import time
 import psutil
-from datetime import datetime
 from enum import Enum
 from typing import List, Tuple, Optional, Dict
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, RPCError, PeerIdInvalid, ChannelInvalid, ChannelPrivate, MessageNotModified
+from pyrogram.errors import FloodWait, RPCError, PeerIdInvalid, ChannelInvalid, ChannelPrivate
 from aiohttp import web
 
 # --- LOGGING SYSTEM ---
@@ -24,13 +23,12 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-# Gunakan print agar muncul di log Render jika error start
-print("--- SYSTEM BOOT: V9.4 MODIFIED (DUAL MESSAGE ONLY) ---", flush=True)
+logger.info("--- SYSTEM BOOT: V9.4 FIX PEER ID (MULTI-BOT VERSION) ---")
 
 # --- KONFIGURASI MULTI-BOT ---
 NUM_BOTS = 5
 clients = []
-bot_data = []
+bot_data = []  # List of dicts for each bot
 
 try:
     PORT = int(os.environ.get("PORT", 8080))
@@ -42,7 +40,6 @@ DEFAULT_BATCH_SIZE = 10000
 DEFAULT_BATCH_TIME = 60
 DEFAULT_CHUNK_SIZE = 50
 DEFAULT_SPEED = 0.1
-CHECKPOINT_INTERVAL = 50  # Update pesan kedua tiap 50 detik
 
 class FilterType(Enum):
     ALL = 'all'
@@ -107,11 +104,14 @@ def make_bar(current: int, total: int, length: int = 10) -> str:
 def parse_link(link: Optional[str]) -> Tuple[Optional[any], Optional[int]]:
     if not link:
         return None, None
+    # Match private link: https://t.me/c/1234567890/100 -> ID: -1001234567890
     private_match = re.search(r"t\.me/c/(\d+)/(\d+)", link)
     if private_match:
         chat_id_str = private_match.group(1)
         msg_id = int(private_match.group(2))
         return int("-100" + chat_id_str), msg_id
+        
+    # Match public link: https://t.me/username/100
     public_match = re.search(r"t\.me/([^/]+)/(\d+)", link)
     if public_match:
         return public_match.group(1), int(public_match.group(2))
@@ -166,11 +166,11 @@ def validate_config(config: Dict) -> Tuple[bool, str]:
             return False, "Batch/Ember values must be positive"
         
     except ValueError:
-        return False, f"Invalid filter type: {filter_str}"
+        return False, f"Invalid filter type: {filter_str}. Pilihan: all, video, foto, dokumen, audio, allout"
     
     return True, ""
 
-# --- 6. WORKER UTAMA (BASIS V9.4 + DUAL MSG) ---
+# --- 6. WORKER UTAMA (SMART CHUNKING / EMBER) ---
 async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: Client, bot_logger):
     bot_data[bot_id]['is_working'] = True
     bot_data[bot_id]['stop_event'].clear()
@@ -190,12 +190,10 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
     
     stats = {'success': 0, 'failed': 0, 'total': end_id - start_id + 1}
     processed_count = 0
-    
-    last_update_time = time.time()       # Timer Dashboard
-    last_checkpoint_time = time.time()   # Timer Checkpoint
-    
+    last_update_time = time.time()
+    last_checkpoint_time = time.time()
     last_error_log = "-"
-    last_success_id = start_id - 1
+    last_success_id = start_id - 1  # Initial, sebelum copy pertama
 
     try:
         for chunk_start in range(start_id, end_id + 1, chunk_size):
@@ -230,9 +228,7 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                 
                 # BATCH SLEEP
                 if processed_count > 0 and processed_count % batch_size == 0:
-                    try:
-                        await status_msg.edit(f"😴 **SEDANG ISTIRAHAT BATCH ({batch_time}s)...**\n\n❄️ Mendinginkan Mesin...")
-                    except MessageNotModified: pass
+                    await status_msg.edit(f"😴 **SEDANG ISTIRAHAT BATCH ({batch_time}s)...**\n\n❄️ Mendinginkan Mesin...")
                     await asyncio.sleep(batch_time)
                     last_update_time = time.time()
 
@@ -269,20 +265,18 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                         
                         stats['success'] += 1
                         processed_count += 1
-                        last_success_id = msg.id
                         msg_success = True
+                        last_success_id = msg.id  # Update last success ID
                         
                         await asyncio.sleep(random.uniform(delay_min, delay_min + 0.5))
                         break
 
                     except FloodWait as e:
                         bot_logger.info(f"FloodWait: Sleeping for {e.value} seconds")
-                        try:
-                            await status_msg.edit(f"🌊 **Kena Limit Telegram!**\nTunggu {e.value} detik...")
-                        except: pass
+                        await status_msg.edit(f"🌊 **Kena Limit Telegram!**\nTunggu {e.value} detik...")
                         await asyncio.sleep(e.value + 10)
                     except (PeerIdInvalid, ChannelInvalid, ChannelPrivate):
-                        # V9.4 Logic: Log error and break (No Auto Refresh)
+                        # Fatal error for this message, but try to continue
                         bot_logger.error(f"Peer Invalid saat copy: {dst_chat}")
                         last_error_log = "Peer ID Invalid (Bot belum join/admin?)"
                         break 
@@ -299,7 +293,7 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                 if not msg_success:
                     stats['failed'] += 1
 
-                # --- UPDATE PESAN 1 (DASHBOARD) - 10 Detik ---
+                # Update Status (Pesan 1 - Dashboard, tiap 10s)
                 if time.time() - last_update_time > 10:
                     current_proc = stats['success'] + stats['failed']
                     remaining_files = stats['total'] - current_proc
@@ -311,7 +305,7 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                     cpu_val, cpu_txt, ram_val, speed_txt = get_system_status(delay_avg)
                     
                     text = (
-                        f"🐎 **WORKHORSE V9.4 MOD (BOT {bot_id})**\n"
+                        f"🐎 **WORKHORSE V9.4: FIX PEER ID (BOT {bot_id})**\n"
                         f"{bar_str}\n\n"
                         f"📊 **Stats:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal `{stats['failed']}` | Sisa `{remaining_files}`\n"
                         f"🏁 **ETA:** ± {eta_text} | Filter: `{filter_type.value.upper()}`\n\n"
@@ -322,61 +316,48 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                     )
                     try:
                         await status_msg.edit(text)
-                    except MessageNotModified:
-                        pass # Mencegah Crash jika pesan sama
+                        last_update_time = time.time()
                     except:
                         pass
-                    last_update_time = time.time()
 
-                # --- UPDATE PESAN 2 (CHECKPOINT) - 50 Detik ---
-                if time.time() - last_checkpoint_time > CHECKPOINT_INTERVAL:
-                    time_now = datetime.now().strftime("%H:%M:%S")
-                    # Tampilan Opsi 1
-                    text_checkpoint = (
-                        f"💾 **AUTOSAVE: CHECKPOINT (BOT {bot_id})**\n"
-                        f"➖➖➖➖➖➖➖➖➖➖\n\n"
-                        f"📌 **Last ID:** `{last_success_id}`\n"
-                        f"🕒 **Saved:** {time_now}"
+                # Update Checkpoint (Pesan 2, tiap 60s)
+                if time.time() - last_checkpoint_time > 60:
+                    saved_time = time.strftime("%H:%M:%S")
+                    checkpoint_text = (
+                        f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
+                        f"📌 Last ID: {last_success_id} 🕒 Saved: {saved_time}"
                     )
                     try:
-                        await checkpoint_msg.edit(text_checkpoint)
-                    except MessageNotModified:
-                        pass
+                        await checkpoint_msg.edit(checkpoint_text)
+                        last_checkpoint_time = time.time()
                     except:
                         pass
-                    last_checkpoint_time = time.time()
             
             del messages_batch
             gc.collect()
 
         final_msg = "✅ **SELESAI!**" if not bot_data[bot_id]['stop_event'].is_set() else "🛑 **DIBATALKAN!**"
+        await status_msg.edit(
+            f"{final_msg}\n\n"
+            f"📊 **Laporan Akhir (BOT {bot_id}):** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal/Skip `{stats['failed']}`\n"
+            f"📝 **Last Error:** {last_error_log}"
+        )
         
-        try:
-            await status_msg.edit(
-                f"{final_msg}\n\n"
-                f"📊 **Laporan Akhir (BOT {bot_id}):** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal/Skip `{stats['failed']}`\n"
-                f"📝 **Last Error:** {last_error_log}"
-            )
-        except: pass
-
-        try:
-            await checkpoint_msg.edit(
-                f"💾 **FINAL CHECKPOINT (BOT {bot_id})**\n"
-                f"➖➖➖➖➖➖➖➖➖➖\n"
-                f"📌 **Finish ID:** `{last_success_id}`\n"
-                f"🏁 **Status:** {final_msg}"
-            )
-        except: pass
+        # Update Checkpoint akhir
+        saved_time = time.strftime("%H:%M:%S")
+        checkpoint_text = (
+            f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
+            f"📌 Last ID: {last_success_id} 🕒 Saved: {saved_time}"
+        )
+        await checkpoint_msg.edit(checkpoint_text)
 
     except Exception as e:
         bot_logger.error(f"❌ CRASH IN WORKER: {e}")
-        try:
-            await status_msg.edit(f"❌ **CRASH SYSTEM:** {e}")
-        except: pass
+        await status_msg.edit(f"❌ **CRASH SYSTEM:** {e}")
     finally:
         bot_data[bot_id]['is_working'] = False
 
-# --- COMMANDS ---
+# --- COMMANDS (DINAMIS & ROBUST) ---
 def register_handlers(app: Client, bot_id: int):
     bot_logger = logging.getLogger(f"{__name__}.bot{bot_id}")
     bot_logger.handlers = logger.handlers
@@ -409,28 +390,37 @@ def register_handlers(app: Client, bot_id: int):
             if not src_chat or not dst_chat or not start_id or not end_id:
                 return await message.reply("❌ **Link Salah Format!** Pastikan link valid (contoh: `https://t.me/c/1234/10`).")
 
-            # KIRIM 2 PESAN
-            status_msg = await message.reply(f"🐎 **Bot {bot_id} Menyiapkan Dashboard...**")
-            checkpoint_msg = await message.reply(f"💾 **Bot {bot_id} Menyiapkan Checkpoint...**")
+            status_msg = await message.reply(f"🔍 **Verifikasi Akses Channel (Bot {bot_id})...**")
 
-            # FIX PEER ID: CHECK AWAL (Seperti V9.4)
-            await status_msg.edit(f"🔍 **Verifikasi Akses Channel (Bot {bot_id})...**")
+            # --- FIX PEER ID INVALID ---
+            # Kita coba 'get_chat' dulu agar bot menyimpan akses hash
             try:
+                # Cek Sumber
                 try:
-                    await client.get_chat(src_chat)
+                    chat_src = await client.get_chat(src_chat)
+                    bot_logger.info(f"Source verified: {chat_src.title}")
                 except Exception as e:
-                    return await status_msg.edit(f"❌ **Gagal Akses SUMBER:**\nBot belum join/ID salah.\nError: `{e}`")
+                    return await status_msg.edit(f"❌ **Gagal Akses SUMBER:**\nBot belum join ke channel/grup sumber atau ID salah.\n\nError: `{e}`")
 
+                # Cek Tujuan
                 try:
-                    await client.get_chat(dst_chat)
+                    chat_dst = await client.get_chat(dst_chat)
+                    bot_logger.info(f"Dest verified: {chat_dst.title}")
                 except Exception as e:
-                    return await status_msg.edit(f"❌ **Gagal Akses TUJUAN:**\nBot belum admin.\nError: `{e}`")
+                    return await status_msg.edit(f"❌ **Gagal Akses TUJUAN:**\nBot belum admin di channel/grup tujuan.\n\nError: `{e}`")
 
             except Exception as e:
                 return await status_msg.edit(f"❌ **Verifikasi Gagal:** {e}")
 
-            # Lanjut
+            # Jika lolos verifikasi, lanjut
             await status_msg.edit(f"🐎 **Bot {bot_id} Memulai Proses Copy...**")
+
+            # Buat pesan checkpoint awal
+            initial_saved_time = time.strftime("%H:%M:%S")
+            checkpoint_msg = await message.reply(
+                f"💾 AUTOSAVE: CHECKPOINT (BOT {bot_id}) ➖➖➖➖➖➖➖➖➖➖\n\n"
+                f"📌 Last ID: {start_id - 1} 🕒 Saved: {initial_saved_time}"
+            )
 
             job = {
                 'src_chat': src_chat, 
@@ -464,7 +454,7 @@ def register_handlers(app: Client, bot_id: int):
         cpu_val, cpu_txt, ram_val, _ = get_system_status(0)
         status_bot = "🔥 Aktif" if bot_data[bot_id]['is_working'] else "💤 Istirahat"
         text = (
-            f"🐴 **Status Server V9.4 MOD (BOT {bot_id})**\n"
+            f"🐴 **Status Server V9.4 (BOT {bot_id})**\n"
             f"──────────────────\n"
             f"🤖 **Status:** {status_bot}\n"
             f"🧠 **CPU:** {cpu_val}% [{cpu_txt}]\n"
@@ -482,8 +472,6 @@ def register_handlers(app: Client, bot_id: int):
 
 # --- INIT BOTS ---
 bot_data = [None] * (NUM_BOTS + 1)
-print("--- INITIALIZING BOTS ---", flush=True)
-bot_count = 0
 for i in range(1, NUM_BOTS + 1):
     try:
         api_id = int(os.environ.get(f"API_ID_{i}", 0))
@@ -491,7 +479,7 @@ for i in range(1, NUM_BOTS + 1):
         bot_token = os.environ.get(f"BOT_TOKEN_{i}", "")
         
         if api_id == 0 or not api_hash or not bot_token:
-            print(f"⚠️ Bot {i} Config Missing", flush=True)
+            logger.info(f"Skipping Bot {i}: Missing config")
             continue
         
         client = Client(
@@ -508,6 +496,33 @@ for i in range(1, NUM_BOTS + 1):
             'stop_event': asyncio.Event()
         }
         register_handlers(client, i)
-        print(f"✅ Bot {i} Initialized", flush=True)
-        bot_count += 1
-    except ValueError as
+        logger.info(f"Bot {i} initialized successfully")
+    except ValueError as e:
+        logger.error(f"❌ Config Error for Bot {i}: {e}")
+
+if not clients:
+    logger.error("No bots initialized. Exiting.")
+    sys.exit(1)
+
+# --- WEB SERVER ---
+async def web_handler(request):
+    return web.Response(text="Multi-Bot Running V9.4 (Fix PeerID).")
+
+async def start_web():
+    app_web = web.Application()
+    app_web.add_routes([web.get('/', web_handler)])
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+async def main():
+    await start_web()
+    logger.info("🤖 Starting Telegram Bots...")
+    for client in clients:
+        await client.start()
+    await idle()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
