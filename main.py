@@ -431,7 +431,7 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                     
                     active_dst = sum(1 for d in dst_list if d['active'])
                     text = (
-                        f"🐎 **WORKHORSE V10 Gen 2 (BOT {bot_id})**\n"
+                        f"🐎 **WORKHORSE V9.6: MULTI-DEST (BOT {bot_id})**\n"
                         f"{bar_str}\n\n"
                         f"📊 **Stats:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal `{stats['failed']}` | Sisa `{remaining_files}`\n"
                         f"🏁 **ETA:** ± {eta_text} | Tujuan Aktif: `{active_dst}/{num_dst}`\n\n"
@@ -576,7 +576,7 @@ def register_handlers(app: Client, bot_id: int):
 
             status_msg = await message.reply(f"🔍 **Verifikasi Akses Channel (Bot {bot_id})...**")
 
-             try:
+            try:
                 chat_src = await client.get_chat(src_chat)
                 bot_logger.info(f"Source verified: {chat_src.title}")
 
@@ -601,7 +601,6 @@ def register_handlers(app: Client, bot_id: int):
                 checkpoint_text += f"📌 Tujuan {idx+1} ({dst['chat']}): Last ID {dst['last_success_id']} | {status} | ETA: {eta_per_dst}\n"
             checkpoint_text += f"🕒 Saved: {initial_saved_time}"
             checkpoint_msg = await message.reply(checkpoint_text)
-
 
             job = {
                 'src_chat': src_chat, 
@@ -644,7 +643,7 @@ def register_handlers(app: Client, bot_id: int):
         cpu_val, cpu_txt, ram_val, _ = get_system_status(0)
         status_bot = "🔥 Aktif" if bot_data[bot_id]['is_working'] else "💤 Istirahat"
         text = (
-            f"🐴 **Status Server V10 Gen 2 (BOT {bot_id})**\n"
+            f"🐴 **Status Server V9.6 (BOT {bot_id})**\n"
             f"──────────────────\n"
             f"🤖 **Status:** {status_bot}\n"
             f"🧠 **CPU:** {cpu_val}% [{cpu_txt}]\n"
@@ -744,4 +743,3 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-
