@@ -25,7 +25,7 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-logger.info("--- SYSTEM BOOT: V9.6 WITH NEW FEATURES (ON/OFF CONFIGURABLE) ---")
+logger.info("--- MESIN TELEGRAM V10 Gen2 (ON/OFF CONFIGURABLE) ---")
 
 # --- KONFIGURASI MULTI-BOT ---
 NUM_BOTS = 5
@@ -431,7 +431,7 @@ async def copy_worker(job: Dict, status_msg, checkpoint_msg, bot_id: int, app: C
                     
                     active_dst = sum(1 for d in dst_list if d['active'])
                     text = (
-                        f"🐎 **WORKHORSE V9.6: MULTI-DEST (BOT {bot_id})**\n"
+                        f"🐎 **WORKHORSE V10 Gen2 (BOT {bot_id})**\n"
                         f"{bar_str}\n\n"
                         f"📊 **Stats:** Total `{stats['total']}` | Sukses `{stats['success']}` | Gagal `{stats['failed']}` | Sisa `{remaining_files}`\n"
                         f"🏁 **ETA:** ± {eta_text} | Tujuan Aktif: `{active_dst}/{num_dst}`\n\n"
@@ -643,7 +643,7 @@ def register_handlers(app: Client, bot_id: int):
         cpu_val, cpu_txt, ram_val, _ = get_system_status(0)
         status_bot = "🔥 Aktif" if bot_data[bot_id]['is_working'] else "💤 Istirahat"
         text = (
-            f"🐴 **Status Server V9.6 (BOT {bot_id})**\n"
+            f"🐴 **Status Server V10 Gen2 (BOT {bot_id})**\n"
             f"──────────────────\n"
             f"🤖 **Status:** {status_bot}\n"
             f"🧠 **CPU:** {cpu_val}% [{cpu_txt}]\n"
